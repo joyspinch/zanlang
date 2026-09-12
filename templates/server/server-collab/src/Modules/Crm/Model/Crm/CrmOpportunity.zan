@@ -1,0 +1,28 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Crm;
+
+/* 商机(销售管道)。stage：1 初步接触 2 需求确认 3 方案报价 4 谈判 5 赢单 0 输单。阶段推进只改 stage 字段，不删记录。 */
+[Table(Name = "crm_opportunity")]
+class CrmOpportunity {
+    [Column(IsIdentity = true)]
+    int id;
+
+    /* 归属租户（软隔离基列，#34）。ORM DDL 不生成 DEFAULT 子句（见 OrmDialect.Ty），
+       列默认由字段初始化器保证：所有 new CrmOpportunity() 插入路径写 1。 */
+    [Column(IsNullable = false)]
+    int tenantId = 1;
+
+    int customerId;
+
+    [Column(StringLength = 128, IsNullable = false)]
+    string title;
+
+    long amount;
+    int stage;
+    int ownerId;
+    long expectedCloseAt;
+
+    long createdAt;
+    long updatedAt;
+}

@@ -1,0 +1,174 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Lic;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Lic;
+
+/* /admin/lic/products 产品管理：授权服务里的"可授权产品"目录。
+ * productId 是客户端 SDK 里 Product("...") 的字符串键；停用即全端点拒绝。*/
+[Route("admin/lic/products/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("产品管理")]
+class Products : AdminController {
+    [HttpGet]
+    [Route("/admin/lic/products")]
+    [Custom(IsMenu = true, Icon = "mdi:package-variant", Perm = PermBit.View)]
+    [Description("产品管理")]
+    async void Index() {
+        ViewData d = await this.Layout("产品管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int total = await this.Product
+            .WhereIf(kw.Length > 0, a => a.productId.Contains(kw))
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .CountAsync();
+        List<ZanWeb.Model.Lic.Product> rows = await this.Product
+            .WhereIf(kw.Length > 0, a => a.productId.Contains(kw))
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            ZanWeb.Model.Lic.Product p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("productId", p.productId);
+            row.Set("name", p.name);
+            row.Set("note", Fmt.Dash(p.note));
+            row.Set("statusText", Products.StatusText(p.status));
+            row.Set("statusClass", Products.StatusClass(p.status));
+            row.Set("nextStatus", p.status == 1 ? "0" : "1");
+            row.Set("toggleText", p.status == 1 ? "停用" : "启用");
+            row.Set("createdAt", Fmt.Day(p.createdAt));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("产品表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增产品");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            ZanWeb.Model.Lic.Product p = await this.Product
+                .Where(a => a.id == id).FirstAsync();
+            if (p == null) { this.Fail(404, "0404", "产品不存在"); }
+            d.Set("dialogTitle", "编辑产品");
+            d.Set("productId", p.productId);
+            d.Set("name", p.name);
+            d.Set("note", p.note);
+            d.Set("status1", "");
+            if (p.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存产品")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string productId = this.Need("productId", "产品标识");
+        string name = this.Need("name", "产品名称");
+        string note = this.In("note");
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        Validator v = new Validator();
+        v.MaxLen(productId, 64, "productId");
+        v.MaxLen(name, 128, "name");
+        if (!v.Ok()) {
+            this.Fail(422, "0003", "字段超长");
+        }
+        ZanWeb.Model.Lic.Product clash = await this.Product
+            .Where(a => a.productId == productId).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "产品标识 " + productId + " 已存在");
+        }
+        if (id > 0) {
+            int n = await this.Product.Update()
+                .Set(a => a.productId, productId)
+                .Set(a => a.name, name)
+                .Set(a => a.note, note)
+                .Set(a => a.status, status)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑产品",
+                "#" + Convert.ToString(id) + " " + productId, n > 0, "");
+            this.Saved("产品已保存");
+            return;
+        }
+        ZanWeb.Model.Lic.Product p = new ZanWeb.Model.Lic.Product();
+        p.productId = productId;
+        p.name = name;
+        p.secret = "";
+        p.status = status;
+        p.note = note;
+        p.createdAt = WebApp.NowSeconds();
+        int newId = await this.Product.Insert(p).ExecuteIdentityAsync();
+        await this.Note("新增产品",
+            "#" + Convert.ToString(newId) + " " + productId, newId > 0, "");
+        this.Saved("产品已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("启用或停用产品")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        int n = await this.Product.Update()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("启用或停用产品", "#" + Convert.ToString(id),
+            n > 0, status == 1 ? "启用" : "停用");
+        this.Saved(status == 1 ? "产品已启用" : "产品已停用，其激活与心跳将被拒绝");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除产品")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        ZanWeb.Model.Lic.Product p = await this.Product
+            .Where(a => a.id == id).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "产品不存在"); }
+        int codes = await this.LicenseCode
+            .Where(a => a.productId == id).CountAsync();
+        int grants = await this.LicenseGrant
+            .Where(a => a.productId == id).CountAsync();
+        if (codes > 0 || grants > 0) {
+            this.Fail(400, "0004", "该产品下还有 "
+                + Convert.ToString(codes + grants)
+                + " 条激活码/授权，先清理或改用停用");
+        }
+        int n = await this.Product.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除产品",
+            "#" + Convert.ToString(id) + " " + p.productId, n > 0, "");
+        this.Saved("产品已删除");
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

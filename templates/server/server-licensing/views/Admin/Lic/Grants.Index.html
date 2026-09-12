@@ -1,0 +1,56 @@
+<div class="card">
+  <form class="toolbar" data-search action="/admin/lic/grants">
+    <input class="input w160" type="search" name="kw" value="{{kw}}" placeholder="搜索账号">
+    <select class="input w140" name="product">
+      <option value="0">全部产品</option>
+      {{#each products}}<option value="{{id}}" {{selected}}>{{name}}</option>{{/each}}
+    </select>
+    <button class="btn sm" type="submit">查询</button>
+    <a class="btn sm" href="/admin/lic/grants" data-load>重置</a>
+    <span class="sp"></span>
+    {{#if canCreate}}<a class="btn sm primary" href="/admin/lic/grants/form" data-dialog>发放授权</a>{{/if}}
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th class="num" style="width:56px">ID</th>
+        <th style="width:130px">产品</th>
+        <th style="width:130px">授权主体</th>
+        <th style="width:80px">期限</th>
+        <th style="width:100px">到期</th>
+        <th style="width:80px">设备数</th>
+        <th style="width:80px">在线座位</th>
+        <th>来源</th>
+        <th class="mid" style="width:64px">状态</th>
+        <th class="ops">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each rows}}
+      <tr>
+        <td class="num muted">{{id}}</td>
+        <td>{{productName}}</td>
+        <td>{{subject}}</td>
+        <td>{{durationText}}</td>
+        <td><span class="tag {{expiresClass}}">{{expiresText}}</span></td>
+        <td>{{maxDevices}}</td>
+        <td>{{maxSeats}}</td>
+        <td class="ellip muted">{{sourceText}}</td>
+        <td class="mid"><span class="tag {{disabledClass}}">{{disabledText}}</span></td>
+        <td class="ops">
+          {{#if canUpdate}}<a href="/admin/lic/grants/form?id={{id}}" data-dialog>调整</a>
+          <a href="#" data-post="/admin/lic/grants/status" data-args="id={{id}}&disabled={{nextDisabled}}">{{toggleText}}</a>{{/if}}
+          {{#if canDelete}}<a href="#" data-post="/admin/lic/grants/delete" data-args="id={{id}}" data-confirm="删除后该授权立即失效，在线终端将被释放，确定吗？">删除</a>{{/if}}
+        </td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if empty}}<div class="empty">还没有账号授权——点"发放授权"给 sys_user 账号开通产品</div>{{/if}}
+  <div class="pager">
+    <span>共 {{total}} 条 · 第 {{page}}/{{pages}} 页</span>
+    <span class="sp"></span>
+    {{#if prev}}<a class="btn sm" href="?page={{prev}}&kw={{kw}}&product={{product}}" data-load>上一页</a>{{/if}}
+    {{#if next}}<a class="btn sm" href="?page={{next}}&kw={{kw}}&product={{product}}" data-load>下一页</a>{{/if}}
+  </div>
+</div>

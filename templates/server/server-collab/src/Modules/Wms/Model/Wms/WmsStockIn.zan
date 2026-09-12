@@ -1,0 +1,28 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Wms;
+
+/* 入库流水。只 INSERT 不 UPDATE：一笔入库提交后不可改，更正走反向流水。createdAt 同时是流水时序键。 */
+[Table(Name = "wms_stock_in")]
+class WmsStockIn {
+    [Column(IsIdentity = true)]
+    int id;
+
+    /* 归属租户（软隔离基列，#34）。ORM DDL 不生成 DEFAULT 子句（见 OrmDialect.Ty），
+       列默认由字段初始化器保证：所有 new WmsStockIn() 插入路径写 1。 */
+    [Column(IsNullable = false)]
+    int tenantId = 1;
+
+    [Column(StringLength = 32, IsNullable = false)]
+    string billNo;
+
+    int warehouseId;
+    int skuId;
+    long qty;
+    int operatorId;
+
+    [Column(StringLength = 256)]
+    string remark;
+
+    long createdAt;
+}

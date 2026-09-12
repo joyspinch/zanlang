@@ -1,0 +1,34 @@
+<div data-title="{{dialogTitle}}" data-wide>
+  <form id="codes-form" data-submit-x action="/admin/lic/codes/generate">
+    <div class="form">
+      <label>产品</label>
+      <select class="input" name="productId" required>
+        {{#each products}}<option value="{{id}}" {{selected}}>{{name}}</option>{{/each}}
+      </select>
+      <label>数量（1-500）</label>
+      <input class="input" type="number" name="count" value="{{count}}" min="1" max="500" required>
+      <label>授权期限</label>
+      <select class="input" name="durationDays">
+        <option value="30">按月（30 天）</option>
+        <option value="90">按季（90 天）</option>
+        <option value="365">按年（365 天）</option>
+        <option value="0">终身</option>
+      </select>
+      <label>设备数上限（0 = 不限）</label>
+      <input class="input" type="number" name="maxDevices" value="{{maxDevices}}" min="0" max="99">
+      <label>备注</label>
+      <input class="input" name="note" maxlength="256" placeholder="批次用途，例如 2026 春季渠道">
+    </div>
+    <footer style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+      <button class="btn" type="button" data-close>关闭</button>
+      <button class="btn primary" type="button" data-generate>生成</button>
+    </footer>
+  </form>
+  <div id="codes-result" style="display:none;margin-top:12px">
+    <p class="hint" style="color:#b45309">明文只显示这一次，立即复制保存：</p>
+    <textarea id="codes-text" class="input mono" rows="8" style="width:100%" readonly></textarea>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn sm" type="button" data-copycodes>复制全部</button>
+    </div>
+  </div>
+</div>

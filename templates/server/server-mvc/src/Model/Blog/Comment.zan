@@ -1,0 +1,29 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Blog;
+
+/* 读者评论；初始状态 0，仅编辑审核后才可见，公开表单无法自行发布。 */
+[Table(Name = "blog_comment")]
+class Comment {
+    [Column(IsIdentity = true)]
+    int id;
+
+    int postId;
+
+    [Column(StringLength = 64)]
+    string author;
+
+    [Column(StringLength = 128)]
+    string email;
+
+    [Column(StringLength = 2000, IsNullable = false)]
+    string content;
+
+    /* 0=待审核，1=已发布，2=已拒绝。 */
+    int status;
+
+    [Column(StringLength = 64)]
+    string ip;
+
+    long createdAt;
+}

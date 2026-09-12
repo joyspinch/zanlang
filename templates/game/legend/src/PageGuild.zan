@@ -1,0 +1,162 @@
+﻿using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 5「行会」——照原版逐像素还原（`mir2/mir/行会.png`）。
+///
+/// 8 列 × 12 行：排名 / 行会名称 / 等级 / 成员数 / 会长 / 行会物资 /
+/// 限制等级 / 申请。表头带满宽青字，格子各自成框。
+///
+/// 两列不是纯文字，所以这两行的格子是本页自己拼的（行骨架仍走
+/// `TableUi.TblRowBoxes`）：
+///   · 等级列 = 一枚**红椭圆徽章**（47×20 设备、白字「二十」）。原版这
+///     12 行徽章**逐像素相同**——是「行会等级」的图标位，不是逐行数据。
+///   · 申请列 = 97×27 设备按钮（比称谓页的「领取」82 宽）。
+///
+/// 页脚与称谓/爵位**不同**：左组是「创建行会」钮 + 提示
+/// 「创建行会需要沃玛号角和500W金币」，右组**没有「说明」钮**，
+/// 只有 上一页 / 1/13 / 下一页。
+///
+/// 配色（原版实测）：排名白、行会名称青、会长青、行会物资青、成员数黄
+/// `#d4d400`、限制等级品红 `#d4436a`（与称谓页「攻击」同色）。
+partial class LegendApp {
+    /// 表头八列。
+    static List<string> GuildHeads() {
+        List<string> h = new List<string>();
+        h.Add("排名"); h.Add("行会名称"); h.Add("等级"); h.Add("成员数");
+        h.Add("会长"); h.Add("行会物资"); h.Add("限制等级"); h.Add("申请");
+        return h;
+    }
+
+    /// 等级徽章上的字。原版 12 行完全一致（是图标位而非逐行等级值），
+    /// 故取常量而不是每行一格数据。
+    static string GuildLvText() { return "二十"; }
+
+    /// 一行行会数据。**一行一实体**——原先是 5 个平行数组（行会名 / 成员数 /
+    /// 会长 / 物资 / 限制等级）靠下标对齐。成员数拆成「当前 + 上限」两个数、
+    /// 物资与限制等级存数值（物资 11 位，超 int32），显示时才拼字。
+    class GuildRow {
+        string name;
+        int members;
+        int memberCap;
+        string master;
+        long goods;
+        int limitLevel;
+        string MemText() { return Rules.N(members) + "/" + Rules.N(memberCap); }
+        string GoodsText() { return Convert.ToString(goods); }
+        string LimitText() { return Rules.N(limitLevel) + "级"; }
+    }
+
+    /// 12 行行会数据（照 `行会.png` 逐行抄录；名次即下标 + 1）。上限原版恒 48。
+    static List<GuildRow> guildData = null;
+    static List<GuildRow> GuildData() {
+        if (guildData != null) { return guildData; }
+        List<GuildRow> v = new List<GuildRow>();
+        v.Add(GuildRowOf("花落三千", 47, "漆黑天使", 92490177127, 20));
+        v.Add(GuildRowOf("哇卡卡", 4, "遗忘者", 15226824211, 20));
+        v.Add(GuildRowOf("神兵利器", 8, "风之魔装机神", 6295621723, 20));
+        v.Add(GuildRowOf("自由之翼", 5, "曲颈向天歌", 5909780090, 20));
+        v.Add(GuildRowOf("近代第一城", 37, "Simple", 2969990226, 20));
+        v.Add(GuildRowOf("千涯", 20, "道职", 1203290188, 500));
+        v.Add(GuildRowOf("永恒总会", 19, "龙卫——圣战", 732242069, 20));
+        v.Add(GuildRowOf("古烈大帝", 3, "鑫森淼焱垚", 451730366, 20));
+        v.Add(GuildRowOf("新生", 17, "三胖", 331378877, 20));
+        v.Add(GuildRowOf("滥竽充数", 48, "无敌绵羊", 307235779, 20));
+        v.Add(GuildRowOf("天上...人间", 11, "龙卫——法神", 231241407, 600));
+        v.Add(GuildRowOf("第一个行会", 5, "龙卫——天尊", 169101711, 600));
+        guildData = v;
+        return guildData;
+    }
+
+    static GuildRow GuildRowOf(string name, int members, string master,
+                               long goods, int limitLevel) {
+        GuildRow r = new GuildRow();
+        r.name = name; r.members = members; r.memberCap = 48;
+        r.master = master; r.goods = goods; r.limitLevel = limitLevel;
+        return r;
+    }
+
+    void BuildGuildPage() {
+        Panel page0 = Panel.Column(); page0.Class = "tbl-page";
+        page0.Pad(0); page0.Gap(0); page0.Grow(); content.With(page0);
+
+        List<int> ws = Spec.TblGuildCols();
+        Panel box = TblBox(); page0.With(box);
+        box.With(TblHead(GuildHeads(), ws));
+
+        Panel headGap = Panel.Row(); headGap.Pad(0);
+        headGap.Prefer(0, Spec.TblHeadGap()); box.With(headGap);
+
+        Panel wall = Panel.Column(); wall.Pad(0); wall.Gap(Spec.TblRowGap());
+        box.With(wall);
+
+        List<GuildRow> rows = GuildData();
+        for (int r = 0; r < Spec.TblRows(); r = r + 1) {
+            GuildRow gu = rows[r];
+            List<Panel> cells = new List<Panel>();
+            cells.Add(TblCell(Rules.N(r + 1), "guild-c0", ws[0]));
+            cells.Add(TblCell(gu.name, "guild-c1", ws[1]));
+            cells.Add(TblCellBox(GuildLvBadge(), ws[2]));
+            cells.Add(TblCell(gu.MemText(), "guild-c2", ws[3]));
+            cells.Add(TblCell(gu.master, "guild-c1", ws[4]));
+            cells.Add(TblCell(gu.GoodsText(), "guild-c1", ws[5]));
+            cells.Add(TblCell(gu.LimitText(), "guild-c3", ws[6]));
+            cells.Add(TblActionCell("申请", "guild-btn", Spec.GuildApplyW(),
+                                    Spec.GuildApplyH(), ws[7], TblRowHAt(r),
+                                    () => { GuildApply(gu); }));
+            wall.With(TblRowBoxes(cells, r, "tbl-row"));
+        }
+        box.With(TblPad(Spec.TblBottomPad()));
+
+        Panel footGap = Panel.Row(); footGap.Pad(0);
+        footGap.Prefer(0, Spec.TblFootGap()); page0.With(footGap);
+
+        SignalInt pgSig = new SignalInt(1);
+        Pagination pg = new Pagination(13, pgSig);
+        pg.Class = "simple";
+        pg.PrevText("上一页"); pg.NextText("下一页");
+        pg.Named("guild-pager");
+        page0.With(TblFootOpt(GuildFootLeft(), pg, Spec.GuildFootPadL(), false));
+    }
+
+    /// 等级列的红椭圆徽章：定尺寸子盒 + 居中白字（居中同样靠 flex
+    /// `justify-content`——`Label` 不认 `text-align`，与表格格子同理）。
+    Panel GuildLvBadge() {
+        Panel b = Panel.Row(); b.Class = "guild-lv";
+        b.Pad(0); b.Prefer(Spec.GuildLvW(), Spec.GuildLvH());
+        Label t = Text(GuildLvText(), "guild-lv-t", 0);
+        t.Grow();
+        b.With(t);
+        return b;
+    }
+
+    /// 页脚左组：「创建行会」钮 + 16 设备缝 + 提示文字（页脚左内缩 25 设备
+    /// 由 `TblFootOpt` 的 padL 给，比称谓/爵位的 18 宽）。
+    Panel GuildFootLeft() {
+        Panel left = Panel.Row(); left.Pad(0); left.Gap(0);
+        left.Prefer(0, Spec.TblFootH());
+        left.With(BtnDev("创建行会", "tbl-btn", Spec.GuildCreateW(),
+                         Spec.TblFootH(), () => { GuildCreate(); }));
+        Panel gap = Panel.Row(); gap.Pad(0);
+        gap.Prefer(Spec.GuildCreateGap(), Spec.TblFootH()); left.With(gap);
+        Label hint = Text("创建行会需要沃玛号角和500W金币", "guild-hint", 0);
+        hint.Prefer(0, Spec.TblFootH());
+        left.With(hint);
+        return left;
+    }
+
+    /// 「申请」钮：尚未接玩法，按本模板惯例给明确反馈（不假装已实现）。
+    void GuildApply(GuildRow gu) {
+        string msg = "已申请加入：「" + gu.name + "」";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+
+    /// 「创建行会」钮：同上——原版要沃玛号角 + 500W 金币，玩法未接。
+    void GuildCreate() {
+        string msg = "创建行会需要沃玛号角和500W金币";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}

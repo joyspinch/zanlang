@@ -1,0 +1,1 @@
+{"animationEasing":"quarticInOut","animationDuration":1000,"animationDurationUpdate":1000,"animationEasingUpdate":"quarticInOut","dataset":{"source":[[1,156]]},"tooltip":{},"angleAxis":{"type":"value","startAngle":0,"show":false,"min":0,"max":200},"radiusAxis":{"type":"value","show":false},"polar":{},"series":[{"type":"custom","coordinateSystem":"polar"}]}

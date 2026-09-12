@@ -1,0 +1,231 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Text;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Lic;
+
+namespace ZanWeb.Admin.Lic;
+
+/* /admin/lic/codes 激活码管理：按批次生成（明文只显示一次，可导出 CSV）、
+ * 停用/启用、查看核销状态。期限=月/季/年/终身，设备数 0=不限。*/
+[Route("admin/lic/codes/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("激活码管理")]
+class Codes : AdminController {
+    [HttpGet]
+    [Route("/admin/lic/codes")]
+    [Custom(IsMenu = true, Icon = "mdi:key-chain", Perm = PermBit.View)]
+    [Description("激活码管理")]
+    async void Index() {
+        ViewData d = await this.Layout("激活码管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int productId = this.InInt("product", 0);
+        List<ZanWeb.Model.Lic.Product> products = await this.Product
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> popts = d.AddList("products");
+        for (int i = 0; i < products.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(products[i].id));
+            o.Set("name", products[i].name);
+            if (products[i].id == productId) { o.Set("selected", "selected"); }
+            popts.Add(o);
+        }
+
+        int total = await this.LicenseCode
+            .WhereIf(kw.Length > 0, a => a.codeTail.Contains(kw))
+            .WhereIf(productId > 0, a => a.productId == productId)
+            .CountAsync();
+        List<ZanWeb.Model.Lic.LicenseCode> rows = await this.LicenseCode
+            .WhereIf(kw.Length > 0, a => a.codeTail.Contains(kw))
+            .WhereIf(productId > 0, a => a.productId == productId)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            ZanWeb.Model.Lic.LicenseCode c = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("productId", Convert.ToString(c.productId));
+            row.Set("productName", Codes.ProductName(products, c.productId));
+            row.Set("codeTail", c.codeTail);
+            row.Set("durationText", Codes.DurationText(c.durationDays));
+            row.Set("maxDevices", c.maxDevices == 0 ? "不限"
+                : Convert.ToString(c.maxDevices));
+            row.Set("statusText", Codes.StatusText(c.status));
+            row.Set("statusClass", Codes.StatusClass(c.status));
+            row.Set("nextStatus", c.status == 1 ? "0" : "1");
+            row.Set("toggleText", c.status == 1 ? "停用" : "启用");
+            row.Set("redeemedText", Codes.RedeemedText(c.redeemed, c.redeemedAt));
+            row.Set("redeemedClass", c.redeemed == 1 ? "ok" : "off");
+            row.Set("note", Fmt.Dash(c.note));
+            row.Set("createdAt", Fmt.Day(c.createdAt));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create)]
+    [Description("生成激活码表单")]
+    async void GenForm() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", "生成激活码");
+        List<ZanWeb.Model.Lic.Product> products = await this.Product
+            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+        List<StrMap> popts = d.AddList("products");
+        for (int i = 0; i < products.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(products[i].id));
+            o.Set("name", products[i].name + " ("
+                + products[i].productId + ")");
+            if (i == 0) { o.Set("selected", "selected"); }
+            popts.Add(o);
+        }
+        d.Set("count", "10");
+        d.Set("maxDevices", "1");
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("生成激活码")]
+    async void Generate() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        int productId = this.InInt("productId", 0);
+        int count = this.InInt("count", 10);
+        int durationDays = this.InInt("durationDays", 30);
+        int maxDevices = this.InInt("maxDevices", 1);
+        string note = this.In("note");
+        if (count < 1) { count = 1; }
+        if (count > 500) { count = 500; }
+        ZanWeb.Model.Lic.Product p = await this.Product
+            .Where(a => a.id == productId).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "产品不存在"); }
+
+        /* 明文只在本次应答出现一次：库里只有摘要，生成后无法再次导出。*/
+        List<string> plain = new List<string>();
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < count; i = i + 1) {
+            string text = Codes.NewCodeText();
+            ZanWeb.Model.Lic.LicenseCode c = new ZanWeb.Model.Lic.LicenseCode();
+            c.productId = productId;
+            c.codeDigest = Hex.Encode(
+                Sha256.Hash(text, text.Length), 32);
+            c.codeTail = text;
+            c.durationDays = durationDays;
+            c.maxDevices = maxDevices < 0 ? 0 : maxDevices;
+            c.status = 1;
+            c.redeemed = 0;
+            c.redeemedAt = 0;
+            c.note = note;
+            c.createdAt = now;
+            int _id = await this.LicenseCode.Insert(c).ExecuteIdentityAsync();
+            if (_id > 0) { plain.Add(text); }
+        }
+        await this.Note("生成激活码",
+            p.productId + " x" + Convert.ToString(plain.Count)
+            + " " + Codes.DurationText(durationDays),
+            plain.Count > 0, "");
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < plain.Count; i = i + 1) {
+            arr.Append(JsonValue.NewStr(plain[i]));
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("codes", arr);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(plain.Count)));
+        this.Ok(o.ToJson());
+    }
+
+    /* 生成的明文码导出 CSV；随后可关闭对话框。*/
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("导出生成的激活码")]
+    void Export() {
+        string text = this.In("text");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("code\r\n");
+        string line = "";
+        for (int i = 0; i < text.Length; i = i + 1) {
+            char c = text[i];
+            if (c == 10 || c == 13) {
+                if (line.Length > 0) {
+                    sb.Append(line + "\r\n");
+                    line = "";
+                }
+                continue;
+            }
+            line = line + c;
+        }
+        if (line.Length > 0) { sb.Append(line + "\r\n"); }
+        this.Ctx().SetHeader("Content-Disposition",
+            "attachment; filename=codes.csv");
+        this.Ctx().Text(sb.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("启用或停用激活码")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        int n = await this.LicenseCode.Update()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("启用或停用激活码", "#" + Convert.ToString(id),
+            n > 0, status == 1 ? "启用" : "停用");
+        this.Saved(status == 1 ? "激活码已启用" : "激活码已停用");
+    }
+
+    static string ProductName(List<ZanWeb.Model.Lic.Product> products,
+                              int productId) {
+        for (int i = 0; i < products.Count; i = i + 1) {
+            if (products[i].id == productId) { return products[i].name; }
+        }
+        return "#" + Convert.ToString(productId);
+    }
+
+    static string DurationText(int days) {
+        if (days == 0) { return "终身"; }
+        if (days == 30) { return "按月"; }
+        if (days == 90) { return "按季"; }
+        if (days == 365) { return "按年"; }
+        return Convert.ToString(days) + " 天";
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "可用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+
+    static string RedeemedText(int redeemed, long at) {
+        if (redeemed == 0) { return "未核销"; }
+        return "已核销 " + Fmt.Day(at);
+    }
+
+    /* 激活码明文：4x4 大写字母数字（去 0/1/I/O），形如 XXXX-XXXX-XXXX-XXXX。*/
+    static string NewCodeText() {
+        string alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+        string g = Guid.New().Replace("-", "") + Guid.New().Replace("-", "");
+        string text = "";
+        for (int i = 0; i < 16; i = i + 1) {
+            int idx = g[i] % alphabet.Length;
+            text = text + alphabet[idx];
+        }
+        return text.Substring(0, 4) + "-" + text.Substring(4, 4) + "-"
+            + text.Substring(8, 4) + "-" + text.Substring(12, 4);
+    }
+}

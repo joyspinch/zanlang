@@ -1,0 +1,34 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Lic;
+
+/* 在线会话（座位）：session 只存 SHA-256 摘要；每次心跳刷新 lastSeen，
+ * 座位数按"最近 seatsTtl 秒内有心跳"的会话计数，过期座位自然腾出。*/
+[Table(Name = "lic_session")]
+class LicenseSession {
+    [Column(IsIdentity = true)]
+    int id;
+
+    [Column(IsNullable = false)]
+    int productId;
+
+    /* 关联的授权：激活码来源记 codeId，账号来源记 grantId，另一侧为 0。*/
+    int codeId;
+
+    int grantId;
+
+    int userId;
+
+    [Column(StringLength = 64, IsNullable = false)]
+    string sessionDigest;
+
+    [Column(StringLength = 32, IsNullable = false)]
+    string deviceFp;
+
+    [Column(StringLength = 64)]
+    string subject;
+
+    long lastSeen;
+
+    long createdAt;
+}

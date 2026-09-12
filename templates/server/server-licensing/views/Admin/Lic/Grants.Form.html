@@ -1,0 +1,35 @@
+<div data-title="{{dialogTitle}}">
+  <form data-submit action="/admin/lic/grants/save">
+    <input type="hidden" name="id" value="{{id}}">
+    <div class="form">
+      {{#if edit}}
+      <input type="hidden" name="productId" value="{{productId}}">
+      <label>账号</label>
+      <input class="input" value="{{account}}" disabled>
+      {{/if}}
+      {{#unless edit}}
+      <label>产品</label>
+      <select class="input" name="productId" required>
+        {{#each products}}<option value="{{id}}" {{selected}}>{{name}}</option>{{/each}}
+      </select>
+      <label>账号（sys_user 登录名）</label>
+      <input class="input" name="account" value="{{account}}" required maxlength="64">
+      {{/unless}}
+      <label>授权期限</label>
+      <select class="input" name="durationDays">
+        <option value="30" {{#if is30}}selected{{/if}}>按月（30 天）</option>
+        <option value="90" {{#if is90}}selected{{/if}}>按季（90 天）</option>
+        <option value="365" {{#if is365}}selected{{/if}}>按年（365 天）</option>
+        <option value="0" {{#if isLife}}selected{{/if}}>终身</option>
+      </select>
+      <label>设备数上限（0 = 不限）</label>
+      <input class="input" type="number" name="maxDevices" value="{{maxDevices}}" min="0" max="99">
+      <label>在线座位上限（0 = 不限）</label>
+      <input class="input" type="number" name="maxSeats" value="{{maxSeats}}" min="0" max="99">
+    </div>
+    <footer style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+      <button class="btn" type="button" data-close>取消</button>
+      <button class="btn primary" type="submit">保存</button>
+    </footer>
+  </form>
+</div>

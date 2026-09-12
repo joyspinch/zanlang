@@ -1,0 +1,45 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Hmi;
+
+/* {{NAME}} 业务逻辑：屏幕在 {{NAME}}.zform 中设计；过程点位在此定义，因为 I/O 属于代码而非布局。 */
+partial class {{NAME}} {
+    static TagTable io;
+    static AlarmBuffer alarms;
+    static IoTag pv;
+    static IoTag level;
+
+    static void OnLoad(Form form) {
+        io = new TagTable();
+        alarms = new AlarmBuffer();
+
+        /* 缩放后的工程值：原始计数为单位 0.1 度/百分比，scale=10 使控件显示一位小数。 */
+        pv = io.Add("TIC101.PV", "C", 10);
+        pv.Range(0, 3000).Limits(300, 2500);
+        level = io.Add("LIC102.PV", "%", 10);
+        level.Range(0, 1000).Limits(100, 900);
+
+        Alarms.Bind(alarms);
+        PvGauge.Bind(pv);
+        LevelBar.Bind(level);
+        RunLed.Set(1);
+        PvTrend.Range(0, 3000);
+        PvTrend.Add("PV", pv, form.GetApp().theme.success);
+
+        /* 单次周期性扫描驱动整个屏幕：读取过程值、记录趋势，再由报警缓冲区按限值触发/复位。 */
+        form.Every(1000, () => {
+            Scan();
+        });
+    }
+
+    /* 用现场总线 / OPC / Modbus 读取替换以下 SetRaw 调用。 */
+    static void Scan() {
+        pv.SetRaw(pv.Raw());
+        level.SetRaw(level.Raw());
+        PvTrend.Sample();
+        alarms.Scan(io);
+        MainStatusBar.SetText(0, "报警： "
+            + Convert.ToString(alarms.UnackedCount()));
+    }
+}

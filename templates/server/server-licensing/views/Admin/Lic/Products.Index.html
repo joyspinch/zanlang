@@ -1,0 +1,44 @@
+<div class="card">
+  <form class="toolbar" data-search action="/admin/lic/products">
+    <input class="input w160" type="search" name="kw" value="{{kw}}" placeholder="搜索产品标识 / 名称">
+    <button class="btn sm" type="submit">查询</button>
+    <a class="btn sm" href="/admin/lic/products" data-load>重置</a>
+    <span class="sp"></span>
+    {{#if canCreate}}<a class="btn sm primary" href="/admin/lic/products/form" data-dialog>新增产品</a>{{/if}}
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th class="num" style="width:56px">ID</th>
+        <th style="width:180px">产品标识</th>
+        <th style="width:180px">名称</th>
+        <th>备注</th>
+        <th class="mid" style="width:64px">状态</th>
+        <th class="ops">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each rows}}
+      <tr>
+        <td class="num muted">{{id}}</td>
+        <td class="mono">{{productId}}</td>
+        <td>{{name}}</td>
+        <td class="ellip muted">{{note}}</td>
+        <td class="mid"><span class="tag {{statusClass}}">{{statusText}}</span></td>
+        <td class="ops">
+          {{#if canUpdate}}<a href="/admin/lic/products/form?id={{id}}" data-dialog>编辑</a>
+          <a href="#" data-post="/admin/lic/products/status" data-args="id={{id}}&status={{nextStatus}}">{{toggleText}}</a>{{/if}}
+          {{#if canDelete}}<a href="#" data-post="/admin/lic/products/delete" data-args="id={{id}}" data-confirm="删除后不可恢复，确定删除该产品吗？">删除</a>{{/if}}
+        </td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if empty}}<div class="empty">还没有产品——先建一个产品，再为它生成激活码</div>{{/if}}
+  <div class="pager">
+    <span>共 {{total}} 条 · 第 {{page}}/{{pages}} 页</span>
+    <span class="sp"></span>
+    {{#if prev}}<a class="btn sm" href="?page={{prev}}&kw={{kw}}" data-load>上一页</a>{{/if}}
+    {{#if next}}<a class="btn sm" href="?page={{next}}&kw={{kw}}" data-load>下一页</a>{{/if}}
+  </div>
+</div>

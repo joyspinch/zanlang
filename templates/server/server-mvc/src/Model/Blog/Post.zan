@@ -1,0 +1,44 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Blog;
+
+/* 博文；body 为正文，summary 为列表摘要，独立列存储，列表页无需加载或截断正文。 */
+[Table(Name = "blog_post")]
+class Post {
+    [Column(IsIdentity = true)]
+    int id;
+
+    [Column(StringLength = 200, IsNullable = false)]
+    string title;
+
+    /* 列表及链接预览中显示；作者留空时从正文首行自动填充。 */
+    [Column(StringLength = 500)]
+    string summary;
+
+    [Column(IsNullable = false)]
+    string body;
+
+    /* blog_category.id；0=未分类。 */
+    int categoryId;
+
+    /* 逗号分隔标签；关联表会增加筛选能力，但此模板不需要，且多出两个管理界面。 */
+    [Column(StringLength = 255)]
+    string tags;
+
+    [Column(StringLength = 255)]
+    string cover;
+
+    [Column(StringLength = 64)]
+    string author;
+
+    /* 1=公开可见；0=草稿。 */
+    int published;
+
+    /* 1=置顶。 */
+    int top;
+
+    int views;
+
+    long createdAt;
+    long updatedAt;
+}

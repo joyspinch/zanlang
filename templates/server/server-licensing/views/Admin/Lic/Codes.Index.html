@@ -1,0 +1,50 @@
+<div class="card">
+  <form class="toolbar" data-search action="/admin/lic/codes">
+    <input class="input w160" type="search" name="kw" value="{{kw}}" placeholder="搜索码尾号">
+    <select class="input w140" name="product">
+      <option value="0">全部产品</option>
+      {{#each products}}<option value="{{id}}" {{selected}}>{{name}}</option>{{/each}}
+    </select>
+    <button class="btn sm" type="submit">查询</button>
+    <a class="btn sm" href="/admin/lic/codes" data-load>重置</a>
+    <span class="sp"></span>
+    {{#if canCreate}}<a class="btn sm primary" href="/admin/lic/codes/genform" data-dialog>生成激活码</a>{{/if}}
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th class="num" style="width:56px">ID</th>
+        <th style="width:150px">产品</th>
+        <th style="width:200px">码（尾号）</th>
+        <th style="width:90px">期限</th>
+        <th style="width:80px">设备数</th>
+        <th style="width:150px">核销</th>
+        <th class="mid" style="width:64px">状态</th>
+        <th class="ops">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each rows}}
+      <tr>
+        <td class="num muted">{{id}}</td>
+        <td>{{productName}}</td>
+        <td class="mono">{{codeTail}}</td>
+        <td>{{durationText}}</td>
+        <td>{{maxDevices}}</td>
+        <td><span class="tag {{redeemedClass}}">{{redeemedText}}</span></td>
+        <td class="mid"><span class="tag {{statusClass}}">{{statusText}}</span></td>
+        <td class="ops">
+          {{#if canUpdate}}<a href="#" data-post="/admin/lic/codes/status" data-args="id={{id}}&status={{nextStatus}}">{{toggleText}}</a>{{/if}}
+        </td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if empty}}<div class="empty">还没有激活码——点"生成激活码"按批次创建</div>{{/if}}
+  <div class="pager">
+    <span>共 {{total}} 条 · 第 {{page}}/{{pages}} 页</span>
+    <span class="sp"></span>
+    {{#if prev}}<a class="btn sm" href="?page={{prev}}&kw={{kw}}&product={{product}}" data-load>上一页</a>{{/if}}
+    {{#if next}}<a class="btn sm" href="?page={{next}}&kw={{kw}}&product={{product}}" data-load>下一页</a>{{/if}}
+  </div>
+</div>

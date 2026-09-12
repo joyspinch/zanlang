@@ -1,0 +1,1 @@
+{"title":{"text":"Drag or pinch to roam the map"},"tooltip":{},"geo":{"id":"my_geo","map":"iceland","aspectScale":0.42261826174069944,"animation":false,"preserveAspect":true,"preserveAspectAlign":"center","preserveAspectVerticalAlign":"middle","clip":true,"left":100,"right":100,"top":100,"bottom":100,"roam":true,"roamTrigger":"selfRect","center":["50%","50%"],"zoom":1}}

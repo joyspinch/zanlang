@@ -1,0 +1,3984 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Threading;
+using System.Knowledge;
+using System.Compiler;      // GenIndex: the .zanmap project index emitter
+
+/// A general-purpose MCP (Model Context Protocol) server: it exposes one
+/// directory tree ("the workspace") plus shell access, and is not tied to any
+/// particular project or language. Three transports share the same
+/// implementation:
+///
+///   --stdio           newline-delimited JSON-RPC 2.0 on stdin/stdout, the
+///                     transport Cursor / Claude Code / VS Code / Windsurf
+///                     launch by default. In this mode stdout carries nothing
+///                     but responses (no banner, no logging).
+///   POST /            JSON-RPC 2.0 (also /mcp and /rpc) — the MCP transport:
+///                     initialize, ping, tools/list, tools/call,
+///                     resources/list, resources/read, prompts/list
+///   REST file API     GET  /api/file?path=      raw bytes (binary safe)
+///                     POST /api/file            {path, content|content_base64}
+///                     GET  /api/files?path=     directory listing as JSON
+///                     POST /api/mkdir|delete|move|copy
+///                     GET  /health              liveness/metadata
+///
+/// Generic tools (always available):
+///   zan_start_here, health_check, list_dir, read_file, write_file, edit_file,
+///   mkdir, delete_path, move_path, copy_path, stat_path, find_files,
+///   search_text, run_command, skills_list, skill_read
+///
+/// zan_start_here is the zero-discovery entry point: one call reports the
+/// project layout, the build/test commands, the coding rules and the rest of
+/// the tool catalog, so a model never has to crawl the tree to get oriented.
+///
+/// Optional tools, registered only when the Zan toolchain / knowledge files
+/// are actually present next to the server, so the same binary serves a plain
+/// directory just as well as a Zan checkout:
+///   zan_api_search, zan_lookup_symbol, zan_list_members, zan_find_refs,
+///   zan_project_overview, zan_route_lookup, zan_orm_lookup,
+///   zan_change_impact, zan_read_context, zan_refresh_index,
+///   zan_example, zan_compile, zan_build_project, build, zan_form_schema
+///
+/// Usage:
+///   mcp_server [workspace-dir] [options]
+///     --stdio            serve JSON-RPC on stdin/stdout instead of HTTP
+///     --host <addr>      bind address (default 127.0.0.1; 0.0.0.0 to publish)
+///     --skills <dir>     directory of skills (<name>/SKILL.md) served by
+///                        skills_list / skill_read, on top of the workspace's
+///                        own .agents\skills
+///     --frozen-tools     always advertise the whole catalog, even the tools
+///                        this deployment cannot back. A hosted server shared
+///                        by many projects wants this: tools/list becomes
+///                        byte-identical everywhere, so the client's prompt
+///                        prefix stays cacheable instead of changing per
+///                        workspace. Calls to a missing tool answer with the
+///                        reason.
+///     --port <n>         TCP port (default 18848)
+///     --token <secret>   require "Authorization: Bearer <secret>"
+///     --token-env <VAR>  read the token from an environment variable instead,
+///                        so it is not visible in the process list
+///     --name <id>        serverInfo.name reported to clients
+///     --read-only        reject every mutating tool and endpoint
+///     --no-exec          reject run_command (file access stays available)
+///     --max-read <n>     per-read byte cap (default 8388608)
+///     --workers <n>      serve from n processes (default 1)
+///     --knowledge <dir>  directory holding symbols.json / refs.json /
+///                        gallery.json
+///     --zanc <path>      Zan compiler used by the optional zan_* tools
+///     --stdlib <dir>     stdlib passed to that compiler
+///     --sdk-root <dir>   SDK installation root; defaults to the directory the
+///                        executable lives in, or its parent when the exe sits
+///                        in a subdirectory of the SDK (the release ships it as
+///                        <sdk>\tools\zan-mcp.exe)
+///
+/// One-shot mode, no server involved:
+///   mcp_server --init-agent [project-dir] [--force]
+///     Installs the AI onboarding pack from <sdk>\ai into a project:
+///     AGENTS.md, .agents\skills\, .mcp.json, .cursor\mcp.json,
+///     .vscode\mcp.json, with <ZAN_SDK> / <ZAN_MCP> / <ZAN_PROJECT> expanded
+///     for this installation. Existing files are kept unless --force is given.
+///     project-dir defaults to the current directory.
+///
+/// Environment fallbacks: MCP_HOST, MCP_PORT, MCP_TOKEN, MCP_ROOT,
+/// MCP_SKILLS, MCP_FROZEN_TOOLS.
+///
+/// SECURITY: every path is resolved against the workspace root and rejected if
+/// it escapes it (absolute paths, drive letters and `..` segments). A token is
+/// mandatory in practice whenever --host is not a loopback address; the server
+/// warns at startup if it is reachable from the network without one.
+
+class McpServer {
+    // ---- configuration ------------------------------------------------------
+    static string root;          // workspace root, absolute, no trailing slash
+    static string host;
+    static int port;
+    static string token;
+    static string serverName;
+    static bool readOnly;
+    static bool allowExec;
+    static int maxRead;
+    static int workers;
+    /// Serve on stdin/stdout instead of binding a socket (--stdio).
+    static bool stdio;
+    /// Why the last ParseBody failed, so the client hears the actual reason.
+    static string parseError;
+
+    // ---- optional Zan integration ------------------------------------------
+    static string knowledge;
+    static string indexPath;
+    static string refsPath;
+    static string galleryPath;
+    static string formSchemaPath;
+    /// Project semantic index (System.Compiler.GenIndex output, per workspace):
+    /// routes with their Perm, and ORM entities with their columns.
+    static string routesIndexPath;
+    static string entitiesIndexPath;
+    static string indexManifestPath;
+    static string knowledgeStatus;
+    static bool knowledgeFresh;
+    static string zancPath;
+    static string stdlibPath;
+    /// SDK installation root (holds stdlib\, toolchain\, knowledge\, ai\).
+    static string sdkRoot;
+    /// Skills shipped with the installation (<dir>/<name>/SKILL.md). The
+    /// workspace's own .agents/skills is served alongside it.
+    static string skillsDir;
+    /// Advertise the full catalog regardless of what is installed here.
+    static bool frozenTools;
+    static string workRoot;
+    static int compileSeq;
+
+    static string Version() { return "2.0"; }
+
+    /// The MCP revision this server implements. Clients send their own in
+    /// `initialize`; we echo theirs when we can speak it, which keeps older
+    /// clients working instead of failing the handshake.
+    static string ProtocolVersion() { return "2025-06-18"; }
+
+    static bool SpeaksProtocol(string v) {
+        return v == "2024-11-05" || v == "2025-03-26" || v == "2025-06-18";
+    }
+
+    [DllImport("crt", EntryPoint = "getenv")]
+    static extern string PlatGetEnv(string name);
+
+    // ---- stdio transport primitives ----------------------------------------
+    // Descriptor-level read/write, not Console/FILE*: a pipe makes the C stdio
+    // buffers block-buffered, so a buffered write would sit in the process
+    // until it filled and the client would wait forever for a response that
+    // was already produced. read(2)/write(2) also keep stdout byte-exact,
+    // which the framing requires.
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_read")]
+    static extern int PlatRead(int fd, nint buf, int count);
+
+    [DllImport("crt", EntryPoint = "_write")]
+    static extern int PlatWrite(int fd, nint buf, int count);
+
+    /// _setmode(fd, _O_BINARY): stops the CRT from turning "\n" into "\r\n"
+    /// on the way out and eating "\r" on the way in.
+    [DllImport("crt", EntryPoint = "_setmode")]
+    static extern int PlatSetMode(int fd, int mode);
+    #else
+    [DllImport("crt", EntryPoint = "read")]
+    static extern int PlatRead(int fd, nint buf, int count);
+
+    [DllImport("crt", EntryPoint = "write")]
+    static extern int PlatWrite(int fd, nint buf, int count);
+    #endif
+
+    static nint inBuf;      // stdin read buffer (raw, not ARC managed)
+    static int inCap;
+    static int inLen;       // bytes currently held in inBuf
+    static int inPos;       // next unconsumed byte
+
+    /// Environment variable, or `dflt` when unset or empty. Used so the token
+    /// can be passed without exposing it in the process command line.
+    static string Env(string name, string dflt) {
+        string v = McpServer.PlatGetEnv(name);
+        if (v == null) { return dflt; }
+        if (v == "") { return dflt; }
+        return v;
+    }
+
+    static void Main() {
+        McpServer.root = McpServer.Env("MCP_ROOT", "");
+        McpServer.host = McpServer.Env("MCP_HOST", "127.0.0.1");
+        McpServer.port = McpServer.ParseInt(McpServer.Env("MCP_PORT", ""), 18848);
+        McpServer.token = McpServer.Env("MCP_TOKEN", "");
+        McpServer.serverName = "zan-mcp";
+        McpServer.readOnly = false;
+        McpServer.allowExec = true;
+        McpServer.maxRead = 8388608;
+        McpServer.workers = 1;
+        McpServer.knowledge = "";
+        McpServer.zancPath = "";
+        McpServer.stdlibPath = "";
+        McpServer.compileSeq = 0;
+        McpServer.parseError = "";
+        McpServer.stdio = false;
+        McpServer.sdkRoot = "";
+        McpServer.skillsDir = McpServer.Env("MCP_SKILLS", "");
+        McpServer.frozenTools = McpServer.Env("MCP_FROZEN_TOOLS", "") != "";
+        bool initAgent = false;
+        string initTarget = "";
+        bool force = false;
+
+        int i = 0;
+        int argc = Environment.ArgCount();
+        while (i < argc) {
+            string a = Environment.ArgAt(i);
+            bool hasNext = i + 1 < argc;
+            if (a == "--host" && hasNext) {
+                McpServer.host = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--port" && hasNext) {
+                McpServer.port = McpServer.ParseInt(Environment.ArgAt(i + 1), 18848);
+                i = i + 2; continue;
+            }
+            if (a == "--token" && hasNext) {
+                McpServer.token = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--token-env" && hasNext) {
+                McpServer.token = McpServer.Env(Environment.ArgAt(i + 1), "");
+                i = i + 2; continue;
+            }
+            if (a == "--name" && hasNext) {
+                McpServer.serverName = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--max-read" && hasNext) {
+                McpServer.maxRead = McpServer.ParseInt(Environment.ArgAt(i + 1), 8388608);
+                i = i + 2; continue;
+            }
+            if (a == "--workers" && hasNext) {
+                McpServer.workers = McpServer.ParseInt(Environment.ArgAt(i + 1), 1);
+                i = i + 2; continue;
+            }
+            if (a == "--knowledge" && hasNext) {
+                McpServer.knowledge = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--zanc" && hasNext) {
+                McpServer.zancPath = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--stdlib" && hasNext) {
+                McpServer.stdlibPath = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--skills" && hasNext) {
+                McpServer.skillsDir = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--frozen-tools") {
+                McpServer.frozenTools = true; i = i + 1; continue;
+            }
+            if (a == "--sdk-root" && hasNext) {
+                McpServer.sdkRoot = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--init-agent") {
+                initAgent = true;
+                if (hasNext && !McpServer.IsOption(Environment.ArgAt(i + 1))) {
+                    initTarget = Environment.ArgAt(i + 1); i = i + 2; continue;
+                }
+                i = i + 1; continue;
+            }
+            if (a == "--force") {
+                force = true; i = i + 1; continue;
+            }
+            if (a == "--stdio") {
+                McpServer.stdio = true; i = i + 1; continue;
+            }
+            if (a == "--read-only" || a == "--readonly") {
+                McpServer.readOnly = true; i = i + 1; continue;
+            }
+            if (a == "--no-exec") {
+                McpServer.allowExec = false; i = i + 1; continue;
+            }
+            if (a.Length >= 2 && a.Substring(0, 2) == "--") { i = i + 1; continue; }
+            McpServer.root = a;
+            i = i + 1;
+        }
+        // "." is what an MCP client config usually passes for "the folder you
+        // launched me in"; report and log the real directory instead.
+        if (McpServer.root == "" || McpServer.root == "." || McpServer.root == "./") {
+            McpServer.root = Directory.GetCurrentDirectory();
+        }
+        McpServer.root = McpServer.TrimTrailingSep(McpServer.root);
+
+        // The optional Zan tools resolve against the SDK root, so the published
+        // package (ZanIDE.exe + toolchain/ + stdlib/ + knowledge/ + ai/ with the
+        // server under tools/) stays relocatable, then fall back to the
+        // workspace for repo checkouts.
+        string exeDir = McpServer.TrimTrailingSep(Environment.ExeDir());
+        if (McpServer.sdkRoot == "") {
+            McpServer.sdkRoot = McpServer.ResolveSdkDir(exeDir);
+        }
+        McpServer.sdkRoot = McpServer.TrimTrailingSep(McpServer.sdkRoot);
+        string sdk = McpServer.sdkRoot;
+
+        if (initAgent) {
+            int initRc = McpServer.InitAgent(initTarget, exeDir, force);
+            McpServer.PlatExit(initRc);
+            return;
+        }
+
+        if (McpServer.knowledge == "") {
+            McpServer.knowledge = sdk + "/knowledge";
+            if (!Directory.Exists(McpServer.knowledge)) {
+                McpServer.knowledge = exeDir + "/knowledge";
+            }
+            if (!Directory.Exists(McpServer.knowledge)) {
+                McpServer.knowledge = McpServer.root + "/.zanmap";
+            }
+        }
+        if (McpServer.zancPath == "") {
+            McpServer.zancPath = sdk + "/toolchain/zanc" + McpServer.ExeSuffix();
+            if (!File.Exists(McpServer.zancPath)) {
+                McpServer.zancPath = exeDir + "/toolchain/zanc" + McpServer.ExeSuffix();
+            }
+            if (!File.Exists(McpServer.zancPath)) {
+                McpServer.zancPath = exeDir + "/zanc" + McpServer.ExeSuffix();
+            }
+            if (!File.Exists(McpServer.zancPath)) {
+                McpServer.zancPath = McpServer.root + "/build/zanc" + McpServer.ExeSuffix();
+            }
+        }
+        if (McpServer.stdlibPath == "") {
+            McpServer.stdlibPath = sdk + "/stdlib";
+            if (!Directory.Exists(McpServer.stdlibPath)) {
+                McpServer.stdlibPath = exeDir + "/stdlib";
+            }
+            if (!Directory.Exists(McpServer.stdlibPath)) {
+                McpServer.stdlibPath = McpServer.root + "/stdlib";
+            }
+        }
+        if (McpServer.skillsDir == "") {
+            McpServer.skillsDir = sdk + "/ai/skills";
+            if (!Directory.Exists(McpServer.skillsDir)) {
+                McpServer.skillsDir = sdk + "/tools/ai_pack/skills";
+            }
+            if (!Directory.Exists(McpServer.skillsDir)) {
+                McpServer.skillsDir = exeDir + "/ai/skills";
+            }
+        }
+        McpServer.skillsDir = McpServer.TrimTrailingSep(McpServer.skillsDir);
+        McpServer.indexPath = McpServer.knowledge + "/symbols.json";
+        McpServer.refsPath = McpServer.knowledge + "/refs.json";
+        McpServer.galleryPath = McpServer.knowledge + "/gallery.json";
+        McpServer.formSchemaPath = McpServer.knowledge + "/zform.json";
+        // Per-workspace, not per-installation: these describe the project
+        // being served, and zan_refresh_index rewrites them in place.
+        McpServer.routesIndexPath = McpServer.root + "/.zanmap/routes.json";
+        // RepoMap's text-scanned table is the fallback for a workspace that
+        // was never compiled here: same shape, but no module/perm/params.
+        if (!File.Exists(McpServer.routesIndexPath)
+            && File.Exists(McpServer.root + "/.zanmap/routes.approx.json")) {
+            McpServer.routesIndexPath =
+                McpServer.root + "/.zanmap/routes.approx.json";
+        }
+        McpServer.entitiesIndexPath = McpServer.root + "/.zanmap/entities.json";
+        McpServer.indexManifestPath = McpServer.root + "/.zanmap/index.json";
+        McpServer.KnowledgeCheck(false);
+        McpServer.workRoot = McpServer.root + "/_scratch/mcp_compile";
+        McpServer.InitJobs();
+
+        // stdout belongs to the protocol in stdio mode: not one byte of
+        // banner may go out before the first response.
+        if (McpServer.stdio) {
+            int stdioRc = await McpServer.RunStdio();
+            return;
+        }
+        if (!McpServer.knowledgeFresh) {
+            Console.WriteLine("WARNING: " + McpServer.knowledgeStatus
+                + "; call zan_refresh_knowledge when inputs are available.");
+        }
+
+        Console.WriteLine("MCP server " + McpServer.Version() + " (protocol "
+            + McpServer.ProtocolVersion() + ")");
+        Console.WriteLine("  workspace : " + McpServer.root);
+        Console.WriteLine("  endpoint  : http://" + McpServer.host + ":"
+            + Convert.ToString(McpServer.port) + "/");
+        string mode = "read-write";
+        if (McpServer.readOnly) { mode = "read-only"; }
+        string exec = "run_command enabled";
+        if (!McpServer.CanExec()) { exec = "run_command disabled"; }
+        Console.WriteLine("  mode      : " + mode + ", " + exec);
+        if (McpServer.token == "") {
+            Console.WriteLine("  auth      : none");
+            if (!McpServer.IsLoopback(McpServer.host)) {
+                Console.WriteLine("  WARNING: bound to a non-loopback address with no token;"
+                    + " anyone who can reach this port owns the workspace."
+                    + " Pass --token or --token-env.");
+            }
+        } else {
+            Console.WriteLine("  auth      : Bearer token required");
+        }
+        if (McpServer.ZanToolsAvailable()) {
+            Console.WriteLine("  zan tools : zanc=" + McpServer.zancPath
+                + " stdlib=" + McpServer.stdlibPath);
+        }
+        int rc = await McpServer.Run();
+    }
+
+    static string ExeSuffix() {
+        #if WINDOWS
+        return ".exe";
+        #else
+        return "";
+        #endif
+    }
+
+    static bool IsLoopback(string h) {
+        return h == "127.0.0.1" || h == "localhost" || h == "::1";
+    }
+
+    static bool CanExec() {
+        return McpServer.allowExec && !McpServer.readOnly;
+    }
+
+    static bool ZanToolsAvailable() {
+        return File.Exists(McpServer.zancPath);
+    }
+
+    // ---- SDK layout ---------------------------------------------------------
+
+    [DllImport("crt", EntryPoint = "exit")]
+    static extern void PlatExit(int code);
+
+    static bool IsOption(string a) {
+        return a.Length >= 2 && a.Substring(0, 2) == "--";
+    }
+
+    /// True when `dir` looks like an installed SDK (or a repo checkout): the
+    /// pieces the server hands to zanc live directly under it.
+    static bool LooksLikeSdk(string dir) {
+        if (Directory.Exists(dir + "/stdlib")) { return true; }
+        if (Directory.Exists(dir + "/toolchain")) { return true; }
+        return Directory.Exists(dir + "/ai");
+    }
+
+    /// Where the SDK is installed, given the directory the executable sits in.
+    /// The release ships the server as <sdk>\tools\zan-mcp.exe, so the parent
+    /// wins whenever the exe's own directory carries none of the SDK folders.
+    static string ResolveSdkDir(string exeDir) {
+        if (McpServer.LooksLikeSdk(exeDir)) { return exeDir; }
+        string up = McpServer.ParentOf(exeDir);
+        if (up != "" && McpServer.LooksLikeSdk(up)) { return up; }
+        return exeDir;
+    }
+
+    // ---- --init-agent -------------------------------------------------------
+
+    /// Installs the AI onboarding pack into a project directory. The pack ships
+    /// as a template under <sdk>\ai because AGENTS.md / .mcp.json / .cursor\ /
+    /// .vscode\ only mean anything inside the project being worked on, never in
+    /// the SDK folder. Returns a process exit code.
+    static int InitAgent(string target, string exeDir, bool force) {
+        string project = target;
+        if (project == "" || project == "." || project == "./") {
+            project = Directory.GetCurrentDirectory();
+        }
+        project = McpServer.TrimTrailingSep(project);
+        // The configs record this path for the client, which runs from its own
+        // working directory: only an absolute one survives.
+        if (!McpServer.IsAbsolute(project)) {
+            project = McpServer.TrimTrailingSep(Directory.GetCurrentDirectory())
+                + "/" + project;
+        }
+        if (!Directory.Exists(project)) {
+            Console.WriteLine("error: project directory not found: " + project);
+            return 2;
+        }
+
+        string pack = McpServer.sdkRoot + "/ai";
+        if (!Directory.Exists(pack)) {
+            // Repo checkout: the same files live where they are authored.
+            pack = McpServer.sdkRoot + "/tools/ai_pack";
+        }
+        if (!Directory.Exists(pack)) {
+            Console.WriteLine("error: AI pack not found; looked for "
+                + McpServer.ToNative(McpServer.sdkRoot + "/ai") + " and "
+                + McpServer.ToNative(McpServer.sdkRoot + "/tools/ai_pack"));
+            Console.WriteLine("       pass --sdk-root <sdk install dir> if the"
+                + " server was moved out of the SDK.");
+            return 2;
+        }
+
+        string mcpExe = exeDir + "/zan-mcp" + McpServer.ExeSuffix();
+        if (!File.Exists(mcpExe)) {
+            mcpExe = exeDir + "/mcp_server" + McpServer.ExeSuffix();
+        }
+
+        Console.WriteLine("Installing the Zan AI pack");
+        Console.WriteLine("  sdk     : " + McpServer.ToNative(McpServer.sdkRoot));
+        Console.WriteLine("  pack    : " + McpServer.ToNative(pack));
+        Console.WriteLine("  project : " + McpServer.ToNative(project));
+
+        int written = 0;
+        try {
+        // AGENTS.md and the skills are documentation: they read better with the
+        // platform's own separators. The mcp configs are JSON, where a Windows
+        // backslash would have to be escaped, so those keep forward slashes --
+        // CreateProcess accepts them just as well.
+        written = written + McpServer.InstallOne(pack + "/AGENTS.md",
+            project + "/AGENTS.md", project, mcpExe, false, force);
+        written = written + McpServer.InstallOne(pack + "/mcp.json",
+            project + "/.mcp.json", project, mcpExe, true, force);
+        written = written + McpServer.InstallOne(pack + "/cursor.mcp.json",
+            project + "/.cursor/mcp.json", project, mcpExe, true, force);
+        written = written + McpServer.InstallOne(pack + "/vscode.mcp.json",
+            project + "/.vscode/mcp.json", project, mcpExe, true, force);
+
+        string skills = pack + "/skills";
+        if (Directory.Exists(skills)) {
+            written = written + McpServer.InstallTree(skills,
+                project + "/.agents/skills", project, mcpExe, force);
+        }
+        } catch (Exception e) {
+            Console.WriteLine("error: failed to install AI pack into "
+                + McpServer.ToNative(project) + ": " + e.Message);
+            return 3;
+        }
+
+        Console.WriteLine("INIT_AGENT_OK " + Convert.ToString(written)
+            + " file(s) written into " + McpServer.ToNative(project));
+        if (!File.Exists(mcpExe)) {
+            Console.WriteLine("  note: could not locate the server executable in "
+                + McpServer.ToNative(exeDir) + "; the mcp configs point at "
+                + mcpExe + " -- edit them if that path is wrong.");
+        }
+        Console.WriteLine("  next : open the project in your AI client; it starts"
+            + " the server over stdio and should call zan_start_here first.");
+        Console.WriteLine("  files: AGENTS.md, .mcp.json, .cursor\\mcp.json,"
+            + " .vscode\\mcp.json, .agents\\skills\\");
+        if (!force) {
+            Console.WriteLine("  (files that already existed were left alone;"
+                + " pass --force to overwrite)");
+        }
+        return 0;
+    }
+
+    /// Copies one template file, expanding the installation placeholders.
+    /// Returns 1 when it wrote something, 0 when it skipped.
+    static int InstallOne(string src, string dest, string project,
+                          string mcpExe, bool json, bool force) {
+        if (!File.Exists(src)) { return 0; }
+        if (File.Exists(dest) && !force) {
+            Console.WriteLine("  keep  " + McpServer.RelOf(dest, project)
+                + " (exists)");
+            return 0;
+        }
+        string text = McpServer.Expand(File.ReadAllText(src), project, mcpExe, json);
+        McpServer.EnsureParent(dest);
+        File.WriteAllText(dest, text);
+        Console.WriteLine("  write " + McpServer.RelOf(dest, project));
+        return 1;
+    }
+
+    /// Recursively installs a template directory (the skills tree).
+    static int InstallTree(string srcDir, string destDir, string project,
+                           string mcpExe, bool force) {
+        int n = 0;
+        List<string> files = Directory.GetFiles(srcDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            n = n + McpServer.InstallOne(srcDir + "/" + files[i],
+                destDir + "/" + files[i], project, mcpExe, false, force);
+        }
+        List<string> dirs = Directory.GetDirectories(srcDir);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            n = n + McpServer.InstallTree(srcDir + "/" + dirs[i],
+                destDir + "/" + dirs[i], project, mcpExe, force);
+        }
+        return n;
+    }
+
+    /// Replaces <ZAN_SDK> / <ZAN_MCP> / <ZAN_PROJECT> with this installation's
+    /// paths. JSON destinations keep forward slashes so no escaping is needed.
+    static string Expand(string text, string project, string mcpExe, bool json) {
+        string sdk = McpServer.sdkRoot;
+        string exe = mcpExe;
+        string proj = project;
+        if (json) {
+            // A lone backslash starts an escape in JSON, and every client here
+            // hands the command straight to CreateProcess, which takes forward
+            // slashes just as well -- so JSON gets the posix spelling.
+            sdk = McpServer.ToPosix(sdk);
+            exe = McpServer.ToPosix(exe);
+            proj = McpServer.ToPosix(proj);
+        } else {
+            sdk = McpServer.ToNative(sdk);
+            exe = McpServer.ToNative(exe);
+            proj = McpServer.ToNative(proj);
+        }
+        string s = McpServer.Substitute(text, "<ZAN_MCP>", exe);
+        s = McpServer.Substitute(s, "<ZAN_SDK>", sdk);
+        s = McpServer.Substitute(s, "<ZAN_PROJECT>", proj);
+        return s;
+    }
+
+    /// Replaces every occurrence of `pat` in `s` with `rep`.
+    static string Substitute(string s, string pat, string rep) {
+        if (pat.Length == 0) { return s; }
+        int at = McpServer.Find(s, pat);
+        if (at < 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        string rest = s;
+        while (at >= 0) {
+            sb.Append(rest.Substring(0, at));
+            sb.Append(rep);
+            int cut = at + pat.Length;
+            rest = rest.Substring(cut, rest.Length - cut);
+            at = McpServer.Find(rest, pat);
+        }
+        sb.Append(rest);
+        return sb.ToString();
+    }
+
+    /// True for `/x`, `\x` and `C:\x`; everything else needs the cwd prefixed.
+    static bool IsAbsolute(string p) {
+        if (p.Length == 0) { return false; }
+        int c0 = p[0] & 255;
+        if (c0 == 47 || c0 == 92) { return true; }
+        return p.Length > 1 && (p[1] & 255) == 58;
+    }
+
+    /// Path with forward slashes only, safe to embed in JSON.
+    static string ToPosix(string p) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c == 92) { sb.Append("/"); } else { sb.Append(p.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    /// Path with the platform's separators, for text a human reads.
+    static string ToNative(string p) {
+        #if WINDOWS
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c == 47) { sb.Append("\\"); } else { sb.Append(p.Substring(i, 1)); }
+        }
+        return sb.ToString();
+        #else
+        return p;
+        #endif
+    }
+
+    /// `full` relative to `baseDir`, for compact progress output.
+    static string RelOf(string full, string baseDir) {
+        int n = baseDir.Length;
+        if (full.Length > n + 1 && full.Substring(0, n) == baseDir) {
+            return McpServer.ToNative(full.Substring(n + 1, full.Length - n - 1));
+        }
+        return McpServer.ToNative(full);
+    }
+
+    // ---- stdio transport ----------------------------------------------------
+
+    /// Serves newline-delimited JSON-RPC on stdin/stdout until stdin closes,
+    /// which is how an MCP client shuts a stdio server down. Every message is
+    /// answered by the same RpcOne the HTTP transport uses.
+    static async int RunStdio() {
+        McpServer.inCap = 65536;
+        McpServer.inBuf = NativeMemory.Alloc(McpServer.inCap);
+        McpServer.inLen = 0;
+        McpServer.inPos = 0;
+        #if WINDOWS
+        McpServer.PlatSetMode(0, 32768);   // _O_BINARY
+        McpServer.PlatSetMode(1, 32768);
+        #endif
+        while (true) {
+            string line = McpServer.ReadStdioLine();
+            if (line == null) { break; }
+            string msg = McpServer.Trim(line);
+            if (msg == "") { continue; }
+            JsonValue v = McpServer.ParseBody(msg);
+            if (v == null) {
+                McpServer.WriteStdio(McpServer.RpcErrorDoc(JsonValue.NewNull(),
+                    0 - 32700, McpServer.ParseErrorText()).ToJson());
+                continue;
+            }
+            if (v.IsArray()) {
+                JsonValue outArr = JsonValue.NewArray();
+                for (int i = 0; i < v.Count(); i = i + 1) {
+                    JsonValue one = await McpServer.RpcOne(v.At(i));
+                    if (one != null) { outArr.Append(one); }
+                }
+                // A batch of nothing but notifications gets no response at all.
+                if (outArr.Count() > 0) { McpServer.WriteStdio(outArr.ToJson()); }
+                continue;
+            }
+            JsonValue res = await McpServer.RpcOne(v);
+            if (res != null) { McpServer.WriteStdio(res.ToJson()); }
+        }
+        NativeMemory.Free(McpServer.inBuf);
+        McpServer.inBuf = 0;
+        return 0;
+    }
+
+    /// One line from stdin without its terminator, or null at end of input.
+    /// A JSON-RPC message never contains a bare newline, so line framing is
+    /// enough; messages far larger than the read buffer are assembled across
+    /// refills.
+    static string ReadStdioLine() {
+        StringBuilder sb = new StringBuilder();
+        bool any = false;
+        while (true) {
+            if (McpServer.inPos >= McpServer.inLen) {
+                int got = McpServer.PlatRead(0, McpServer.inBuf, McpServer.inCap);
+                if (got <= 0) {
+                    if (!any) { return null; }
+                    return McpServer.StripCr(sb.ToString());
+                }
+                McpServer.inLen = got;
+                McpServer.inPos = 0;
+            }
+            int start = McpServer.inPos;
+            int avail = McpServer.inLen - start;
+            int nl = NativeMemory.Find(McpServer.inBuf, start, 10, avail);
+            if (nl >= 0) {
+                if (nl > start) {
+                    sb.Append(NativeMemory.GetString(McpServer.inBuf, start, nl - start));
+                }
+                McpServer.inPos = nl + 1;
+                return McpServer.StripCr(sb.ToString());
+            }
+            sb.Append(NativeMemory.GetString(McpServer.inBuf, start, avail));
+            McpServer.inPos = McpServer.inLen;
+            any = true;
+        }
+    }
+
+    static string StripCr(string s) {
+        if (s.Length > 0 && (s[s.Length - 1] & 255) == 13) {
+            return s.Substring(0, s.Length - 1);
+        }
+        return s;
+    }
+
+    /// Writes one message plus its newline to stdout, looping until every byte
+    /// is out (a pipe write is allowed to be partial).
+    static void WriteStdio(string json) {
+        string s = json + "\n";
+        int n = s.Length;
+        nint p = NativeMemory.Alloc(n + 1);
+        NativeMemory.PutString(p, 0, s, n);
+        int off = 0;
+        while (off < n) {
+            int w = McpServer.PlatWrite(1, p + off, n - off);
+            if (w <= 0) { break; }
+            off = off + w;
+        }
+        NativeMemory.Free(p);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer(McpServer.host, McpServer.port);
+        // Writes carry whole files, so the 1 MB stdlib default is too small;
+        // the read cap doubles as the request-body cap.
+        int bodyCap = McpServer.maxRead + 1048576;
+        server.SetMaxRequestBytes(bodyCap);
+        server.SetMaxConnections(512);
+        server.SetTimeout(600000);
+        if (McpServer.workers > 1) { server.Workers(McpServer.workers); }
+        server.OnRequest(McpServer.Handle);
+        await server.Start();
+        return 0;
+    }
+
+    // ---- HTTP routing -------------------------------------------------------
+
+    static async HttpResponse Handle(HttpRequest req) {
+        // Preflight: answer before auth so browsers can learn the headers they
+        // are allowed to send.
+        if (req.method == "OPTIONS") {
+            return McpServer.Cors(HttpResponse.WithStatus(204, "No Content", ""));
+        }
+        if (!McpServer.AuthOk(req)) {
+            return McpServer.Fail(401, "Unauthorized", "unauthorized",
+                "provide 'Authorization: Bearer <token>'");
+        }
+
+        string p = req.path;
+        if (req.method == "GET" && (p == "/health" || p == "/healthz")) {
+            return McpServer.Ok(McpServer.HealthDoc());
+        }
+        if (req.method == "GET" && p == "/api/files") {
+            return McpServer.RestList(McpServer.Query(req.queryString, "path"));
+        }
+        if (req.method == "GET" && p == "/api/file") {
+            return McpServer.RestRead(req);
+        }
+        if (req.method == "POST" && p == "/api/file") {
+            return McpServer.RestWrite(req);
+        }
+        if (req.method == "POST" && p == "/api/mkdir") {
+            return McpServer.RestSimple(req, "mkdir");
+        }
+        if (req.method == "POST" && p == "/api/delete") {
+            return McpServer.RestSimple(req, "delete");
+        }
+        if (req.method == "POST" && p == "/api/move") {
+            return McpServer.RestSimple(req, "move");
+        }
+        if (req.method == "POST" && p == "/api/copy") {
+            return McpServer.RestSimple(req, "copy");
+        }
+        // Clients differ on the trailing slash, and a 404 there looks like a
+        // wrong URL to the user.
+        if (p == "/mcp/" || p == "/rpc/") {
+            p = p.Substring(0, p.Length - 1);
+        }
+        if (req.method == "POST" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            return await McpServer.Rpc(req.body);
+        }
+        if (req.method == "DELETE" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            // Streamable HTTP session teardown. This server keeps no session
+            // state, so acknowledging is the whole implementation.
+            return McpServer.Cors(HttpResponse.WithStatus(204, "No Content", ""));
+        }
+        if (req.method == "GET" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            // A Streamable HTTP client opens GET <endpoint> with
+            // Accept: text/event-stream to receive server-initiated messages.
+            // We have none, and the spec's answer for that is 405 -- replying
+            // with a JSON body instead leaves the client waiting for an SSE
+            // stream that never comes.
+            if (McpServer.WantsSse(req)) {
+                HttpResponse r = HttpResponse.WithStatus(405,
+                    "Method Not Allowed", "");
+                r = r.SetHeader("Allow", "POST, DELETE, OPTIONS");
+                return McpServer.Cors(r);
+            }
+            // Discovery in a browser or with curl: describe the service
+            // instead of returning an opaque error.
+            return McpServer.Ok(McpServer.HealthDoc());
+        }
+        return McpServer.Fail(404, "Not Found", "no such endpoint",
+            "POST / for JSON-RPC, GET /health, GET|POST /api/file,"
+            + " GET /api/files, POST /api/mkdir|delete|move|copy");
+    }
+
+    static bool WantsSse(HttpRequest req) {
+        string a = req.GetHeader("Accept");
+        if (a == "") { a = req.GetHeader("accept"); }
+        return McpServer.Find(a.ToLower(), "text/event-stream") >= 0;
+    }
+
+    /// Constant-time-ish bearer check against the Authorization header only.
+    /// The old implementation searched the whole request text for the token,
+    /// so any client that merely mentioned it in the body was let in.
+    static bool AuthOk(HttpRequest req) {
+        if (McpServer.token == "") { return true; }
+        string h = req.GetHeader("Authorization");
+        if (h == "") { h = req.GetHeader("X-Api-Key"); }
+        else {
+            if (h.Length > 7 && h.Substring(0, 7) == "Bearer ") {
+                h = h.Substring(7, h.Length - 7);
+            }
+        }
+        h = McpServer.Trim(h);
+        if (h.Length != McpServer.token.Length) { return false; }
+        int diff = 0;
+        for (int i = 0; i < h.Length; i = i + 1) {
+            diff = diff | ((h[i] & 255) ^ (McpServer.token[i] & 255));
+        }
+        return diff == 0;
+    }
+
+    static HttpResponse Cors(HttpResponse r) {
+        r = r.SetHeader("Access-Control-Allow-Origin", "*");
+        r = r.SetHeader("Access-Control-Allow-Headers",
+            "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version");
+        r = r.SetHeader("Access-Control-Allow-Methods",
+            "GET, POST, DELETE, OPTIONS");
+        return r;
+    }
+
+    static HttpResponse Ok(JsonValue doc) {
+        return McpServer.Cors(HttpResponse.Json(doc.ToJson()));
+    }
+
+    static HttpResponse Fail(int code, string statusText, string message,
+                             string hint) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(false));
+        o.Put("error", JsonValue.NewStr(message));
+        if (hint != "") { o.Put("hint", JsonValue.NewStr(hint)); }
+        HttpResponse r = HttpResponse.WithStatus(code, statusText, o.ToJson());
+        r = r.SetContentType("application/json");
+        return McpServer.Cors(r);
+    }
+
+    static JsonValue HealthDoc() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("status", JsonValue.NewStr("ok"));
+        o.Put("server", JsonValue.NewStr(McpServer.serverName));
+        o.Put("version", JsonValue.NewStr(McpServer.Version()));
+        o.Put("protocolVersion", JsonValue.NewStr(McpServer.ProtocolVersion()));
+        o.Put("workspace", JsonValue.NewStr(McpServer.root));
+        o.Put("readOnly", JsonValue.NewBool(McpServer.readOnly));
+        o.Put("exec", JsonValue.NewBool(McpServer.CanExec()));
+        o.Put("maxReadBytes", JsonValue.NewNum(Convert.ToString(McpServer.maxRead)));
+        o.Put("zanTools", JsonValue.NewBool(McpServer.ZanToolsAvailable()));
+        o.Put("frozenTools", JsonValue.NewBool(McpServer.frozenTools));
+        o.Put("skillRoots", JsonValue.NewNum(
+            Convert.ToString(McpServer.SkillRoots().Count)));
+        o.Put("platform", JsonValue.NewStr(McpServer.Platform()));
+        return o;
+    }
+
+    static string Platform() {
+        #if WINDOWS
+        return "windows";
+        #elif MACOS
+        return "macos";
+        #else
+        return "linux";
+        #endif
+    }
+
+    // ---- REST file API ------------------------------------------------------
+
+    /// GET /api/file?path=rel[&offset=&limit=&base64=1]
+    /// Returns the raw bytes. Directories answer with the JSON listing so a
+    /// client can use one URL to explore the tree. Binary content is served
+    /// as application/octet-stream; `base64=1` wraps it in JSON instead, for
+    /// transports that cannot carry arbitrary bytes.
+    static HttpResponse RestRead(HttpRequest req) {
+        string rel = McpServer.Query(req.queryString, "path");
+        string full = McpServer.Resolve(rel);
+        if (full == "") { return McpServer.Outside(rel); }
+        if (Directory.Exists(full) && !File.Exists(full)) {
+            return McpServer.RestList(rel);
+        }
+        if (!File.Exists(full)) {
+            return McpServer.Fail(404, "Not Found", "file not found: " + rel, "");
+        }
+        int offset = McpServer.ParseInt(McpServer.Query(req.queryString, "offset"), 0);
+        int limit = McpServer.ParseInt(McpServer.Query(req.queryString, "limit"), 0);
+        byte[] data = McpServer.ReadSlice(full, offset, limit);
+        int n = data.Length;
+        if (McpServer.Query(req.queryString, "base64") == "1") {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("path", JsonValue.NewStr(rel));
+            o.Put("encoding", JsonValue.NewStr("base64"));
+            o.Put("bytes", JsonValue.NewNum(Convert.ToString(n)));
+            o.Put("content_base64",
+                JsonValue.NewStr(Encoding.Base64EncodeBytes(data, n)));
+            return McpServer.Ok(o);
+        }
+        string ct = "application/octet-stream";
+        if (McpServer.Utf8Valid(data, n)) { ct = "text/plain; charset=utf-8"; }
+        // Byte body, not a string: executables and images contain NUL, which
+        // would truncate a string-backed response at the first zero byte.
+        HttpResponse r = HttpResponse.Bytes(data, n, ct);
+        r = r.SetHeader("X-Content-Bytes", Convert.ToString(n));
+        return McpServer.Cors(r);
+    }
+
+    static HttpResponse RestList(string rel) {
+        string full = McpServer.Resolve(rel);
+        if (full == "") { return McpServer.Outside(rel); }
+        if (!Directory.Exists(full)) {
+            return McpServer.Fail(404, "Not Found", "directory not found: " + rel, "");
+        }
+        return McpServer.Ok(McpServer.ListDoc(rel, full));
+    }
+
+    static HttpResponse RestWrite(HttpRequest req) {
+        if (McpServer.readOnly) { return McpServer.ReadOnlyFail(); }
+        JsonValue body = McpServer.ParseBody(req.body);
+        if (body == null) {
+            return McpServer.Fail(400, "Bad Request", "request body is not valid JSON",
+                "send {\"path\":\"...\",\"content\":\"...\"}");
+        }
+        string rel = body.Str("path", "");
+        string full = McpServer.Resolve(rel);
+        if (full == "") { return McpServer.Outside(rel); }
+        byte[] data = null;
+        if (body.Has("content_base64")) {
+            try {
+                data = Encoding.Base64Decode(body.Str("content_base64", ""));
+            } catch (ArgumentException e) {
+                return McpServer.Fail(400, "Bad Request",
+                    "content_base64 is not valid base64: " + e.Message, "");
+            }
+        } else {
+            data = body.Str("content", "").ToBytes();
+        }
+        string why = McpServer.WriteFile(full, data, body.Bool("append", false));
+        if (why != "") {
+            return McpServer.Fail(500, "Internal Server Error", why, "");
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("size", JsonValue.NewNum(Convert.ToString(data.Length)));
+        return McpServer.Ok(o);
+    }
+
+    /// POST /api/mkdir|delete|move|copy — the file-management verbs that share
+    /// a {path} / {from,to} body shape.
+    static HttpResponse RestSimple(HttpRequest req, string verb) {
+        if (McpServer.readOnly) { return McpServer.ReadOnlyFail(); }
+        JsonValue body = McpServer.ParseBody(req.body);
+        if (body == null) {
+            return McpServer.Fail(400, "Bad Request", "request body is not valid JSON", "");
+        }
+        JsonValue args = body;
+        string text = McpServer.FileTool(verb, args);
+        if (text.Length >= 6 && text.Substring(0, 6) == "error:") {
+            return McpServer.Fail(400, "Bad Request",
+                text.Substring(7, text.Length - 7), "");
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("result", JsonValue.NewStr(text));
+        return McpServer.Ok(o);
+    }
+
+    static HttpResponse Outside(string rel) {
+        return McpServer.Fail(403, "Forbidden",
+            "path escapes the workspace root: " + rel,
+            "use workspace-relative paths without '..' or a drive letter");
+    }
+
+    static HttpResponse ReadOnlyFail() {
+        return McpServer.Fail(403, "Forbidden", "server is running --read-only", "");
+    }
+
+    // ---- JSON-RPC -----------------------------------------------------------
+
+    static async HttpResponse Rpc(string body) {
+        JsonValue v = McpServer.ParseBody(body);
+        if (v == null) {
+            return McpServer.RpcFail(JsonValue.NewNull(), 0 - 32700,
+                McpServer.ParseErrorText());
+        }
+        // A batch is a JSON array of requests; answer with an array of the
+        // responses that have ids.
+        if (v.IsArray()) {
+            JsonValue outArr = JsonValue.NewArray();
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                JsonValue one = await McpServer.RpcOne(v.At(i));
+                if (one != null) { outArr.Append(one); }
+            }
+            if (outArr.Count() == 0) { return McpServer.Accepted(); }
+            return McpServer.Cors(HttpResponse.Json(outArr.ToJson()));
+        }
+        JsonValue res = await McpServer.RpcOne(v);
+        if (res == null) { return McpServer.Accepted(); }
+        return McpServer.Cors(HttpResponse.Json(res.ToJson()));
+    }
+
+    /// 202 with no body: the correct answer to a JSON-RPC notification, which
+    /// must not get a response object.
+    static HttpResponse Accepted() {
+        return McpServer.Cors(HttpResponse.WithStatus(202, "Accepted", ""));
+    }
+
+    /// Handles one JSON-RPC message. Returns null for notifications.
+    static async JsonValue RpcOne(JsonValue v) {
+        if (v == null || !v.IsObject()) {
+            return McpServer.RpcErrorDoc(JsonValue.NewNull(), 0 - 32600,
+                "invalid request: expected a JSON-RPC object");
+        }
+        // The id is echoed verbatim: JSON-RPC allows a number, a string or
+        // null, and clients match responses on strict equality.
+        JsonValue id = v.Get("id");
+        bool isNotification = id == null || id.IsNull();
+        string rpc = v.Str("method", "");
+        JsonValue p = v.Get("params");
+
+        if (rpc == "") {
+            if (isNotification) { return null; }
+            return McpServer.RpcErrorDoc(id, 0 - 32600, "invalid request: no method");
+        }
+        if (rpc == "notifications/initialized" || rpc == "initialized"
+            || rpc == "notifications/cancelled") {
+            if (isNotification) { return null; }
+            return McpServer.RpcResultDoc(id, JsonValue.NewObject());
+        }
+        if (rpc == "ping") {
+            return McpServer.RpcResultDoc(id, JsonValue.NewObject());
+        }
+        if (rpc == "initialize") {
+            string want = "";
+            if (p != null) { want = p.Str("protocolVersion", ""); }
+            string speak = McpServer.ProtocolVersion();
+            if (McpServer.SpeaksProtocol(want)) { speak = want; }
+            JsonValue caps = JsonValue.NewObject();
+            caps.Put("tools", JsonValue.NewObject());
+            JsonValue resCap = JsonValue.NewObject();
+            resCap.Put("listChanged", JsonValue.NewBool(false));
+            caps.Put("resources", resCap);
+            JsonValue info = JsonValue.NewObject();
+            info.Put("name", JsonValue.NewStr(McpServer.serverName));
+            info.Put("version", JsonValue.NewStr(McpServer.Version()));
+            JsonValue r = JsonValue.NewObject();
+            r.Put("protocolVersion", JsonValue.NewStr(speak));
+            r.Put("capabilities", caps);
+            r.Put("serverInfo", info);
+            r.Put("instructions", JsonValue.NewStr(
+                "Call zan_start_here FIRST: one call returns the project"
+                + " layout, the build and test commands, the Zan coding rules"
+                + " and what every other tool is for, so you never have to"
+                + " crawl the tree to get oriented. Before writing Zan code,"
+                + " look the API up with zan_lookup_symbol /"
+                + " zan_list_members (zan_api_search for fuzzy fragments),"
+                + " check the blast radius of an edit with zan_find_refs, and"
+                + " copy a shipped pattern from zan_example instead of"
+                + " reading whole files or guessing signatures;"
+                + " check your edit with zan_compile / zan_build_project and"
+                + " read the structured diagnostics."
+                + " Workspace-scoped file and shell access: paths are relative"
+                + " to the workspace root; '..' and absolute paths are"
+                + " rejected. Use read_file with encoding=base64 for binary"
+                + " files."));
+            return McpServer.RpcResultDoc(id, r);
+        }
+        if (rpc == "tools/list") {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("tools", McpServer.ToolsDoc());
+            return McpServer.RpcResultDoc(id, r);
+        }
+        if (rpc == "resources/list") {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("resources", McpServer.ResourcesDoc());
+            return McpServer.RpcResultDoc(id, r);
+        }
+        if (rpc == "resources/read") {
+            string uri = "";
+            if (p != null) { uri = p.Str("uri", ""); }
+            return McpServer.ReadResource(id, uri);
+        }
+        if (rpc == "prompts/list") {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("prompts", JsonValue.NewArray());
+            return McpServer.RpcResultDoc(id, r);
+        }
+        if (rpc == "tools/call") {
+            string name = "";
+            JsonValue targs = null;
+            if (p != null) {
+                name = p.Str("name", "");
+                targs = p.Get("arguments");
+            }
+            if (targs == null) { targs = JsonValue.NewObject(); }
+            string text = await McpServer.CallTool(name, targs);
+            bool bad = text.Length >= 6 && text.Substring(0, 6) == "error:";
+            JsonValue r = JsonValue.NewObject();
+            JsonValue content = JsonValue.NewArray();
+            JsonValue item = JsonValue.NewObject();
+            item.Put("type", JsonValue.NewStr("text"));
+            item.Put("text", JsonValue.NewStr(text));
+            content.Append(item);
+            r.Put("content", content);
+            // Tool failures are reported inside the result with isError, per
+            // the MCP spec: a JSON-RPC error means the call itself was
+            // malformed, and clients surface the two differently.
+            r.Put("isError", JsonValue.NewBool(bad));
+            return McpServer.RpcResultDoc(id, r);
+        }
+        if (isNotification) { return null; }
+        return McpServer.RpcErrorDoc(id, 0 - 32601, "method not found: " + rpc);
+    }
+
+    static JsonValue RpcResultDoc(JsonValue id, JsonValue result) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("id", McpServer.IdOf(id));
+        o.Put("result", result);
+        return o;
+    }
+
+    static JsonValue RpcErrorDoc(JsonValue id, int code, string msg) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("id", McpServer.IdOf(id));
+        JsonValue e = JsonValue.NewObject();
+        e.Put("code", JsonValue.NewNum(Convert.ToString(code)));
+        e.Put("message", JsonValue.NewStr(msg));
+        o.Put("error", e);
+        return o;
+    }
+
+    static JsonValue IdOf(JsonValue id) {
+        if (id == null) { return JsonValue.NewNull(); }
+        return id;
+    }
+
+    static HttpResponse RpcFail(JsonValue id, int code, string msg) {
+        JsonValue doc = McpServer.RpcErrorDoc(id, code, msg);
+        return McpServer.Cors(HttpResponse.Json(doc.ToJson()));
+    }
+
+    /// Strict parse: malformed input becomes a real error instead of the
+    /// half-parsed tree ParseLenient would hand back. On failure the reason is
+    /// left in `parseError` so the client is told what was wrong with its
+    /// payload instead of a bare "parse error".
+    static JsonValue ParseBody(string body) {
+        McpServer.parseError = "";
+        if (McpServer.Trim(body) == "") {
+            McpServer.parseError = "empty request body";
+            return null;
+        }
+        try {
+            return JsonValue.Parse(body);
+        } catch (JsonException e) {
+            McpServer.parseError = e.Message;
+            return null;
+        }
+    }
+
+    static string ParseErrorText() {
+        if (McpServer.parseError == "") { return "parse error"; }
+        return "parse error: " + McpServer.parseError;
+    }
+
+    // ---- resources ----------------------------------------------------------
+    // Read-only artifacts a client can subscribe to without a tool call. The
+    // RepoMap outputs are exposed when they exist (see docs/ai-assist.md).
+
+    static JsonValue ResourcesDoc() {
+        JsonValue arr = JsonValue.NewArray();
+        // Exactly the file names tools/repomap/RepoMap.zan writes.
+        McpServer.AddResource(arr, "repo://map", ".zanmap/repo.map.txt",
+            "Workspace outline: every file with its classes and members",
+            "text/plain");
+        McpServer.AddResource(arr, "repo://symbols", ".zanmap/symbols.json",
+            "Symbol index (one JSON record per line)", "application/json");
+        McpServer.AddResource(arr, "repo://routes", McpServer.RoutesRel(),
+            "HTTP route index", "application/json");
+        McpServer.AddResource(arr, "repo://entities", ".zanmap/entities.json",
+            "ORM entities: table, columns, indexes and generated facades",
+            "application/json");
+        McpServer.AddResource(arr, "repo://index", ".zanmap/index.json",
+            "Semantic index manifest: counts and the source file table",
+            "application/json");
+        return arr;
+    }
+
+    static void AddResource(JsonValue arr, string uri, string rel, string desc,
+                            string mime) {
+        if (!File.Exists(McpServer.root + "/" + rel)) { return; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("uri", JsonValue.NewStr(uri));
+        o.Put("name", JsonValue.NewStr(rel));
+        o.Put("description", JsonValue.NewStr(desc));
+        o.Put("mimeType", JsonValue.NewStr(mime));
+        arr.Append(o);
+    }
+
+    /// Workspace-relative name of the route table actually in use: GenIndex's
+    /// routes.json when the project was compiled here, RepoMap's text-scanned
+    /// routes.approx.json otherwise.
+    static string RoutesRel() {
+        string p = McpServer.routesIndexPath;
+        string approx = "routes.approx.json";
+        if (p.Length >= approx.Length
+            && p.Substring(p.Length - approx.Length, approx.Length) == approx) {
+            return ".zanmap/" + approx;
+        }
+        return ".zanmap/routes.json";
+    }
+
+    static JsonValue ReadResource(JsonValue id, string uri) {
+        string rel = "";
+        string mime = "application/json";
+        if (uri == "repo://map") { rel = ".zanmap/repo.map.txt"; mime = "text/plain"; }
+        if (uri == "repo://symbols") { rel = ".zanmap/symbols.json"; }
+        if (uri == "repo://routes") { rel = McpServer.RoutesRel(); }
+        if (uri == "repo://entities") { rel = ".zanmap/entities.json"; }
+        if (uri == "repo://index") { rel = ".zanmap/index.json"; }
+        if (rel == "") {
+            return McpServer.RpcErrorDoc(id, 0 - 32602, "unknown resource: " + uri);
+        }
+        string full = McpServer.root + "/" + rel;
+        if (!File.Exists(full)) {
+            return McpServer.RpcErrorDoc(id, 0 - 32002,
+                "resource not generated yet: " + rel
+                + "; build tools/repomap/RepoMap.zan and run it on this workspace");
+        }
+        JsonValue item = JsonValue.NewObject();
+        item.Put("uri", JsonValue.NewStr(uri));
+        item.Put("mimeType", JsonValue.NewStr(mime));
+        item.Put("text", JsonValue.NewStr(File.ReadAllText(full)));
+        JsonValue contents = JsonValue.NewArray();
+        contents.Append(item);
+        JsonValue r = JsonValue.NewObject();
+        r.Put("contents", contents);
+        return McpServer.RpcResultDoc(id, r);
+    }
+
+    // ---- tools --------------------------------------------------------------
+
+    static async string CallTool(string name, JsonValue args) {
+        if (name == "zan_start_here" || name == "start_here") {
+            return McpServer.StartHere().ToJson();
+        }
+        if (name == "health_check") { return McpServer.HealthDoc().ToJson(); }
+        if (name == "run_command") { return await McpServer.RunCommand(args); }
+        if (name == "skills_list") { return McpServer.SkillsList(); }
+        if (name == "skill_read" || name == "skill_get") {
+            return McpServer.SkillRead(args);
+        }
+
+        // zan_* tools stay optional so the server is useful on any directory.
+        if (name == "zan_api_search") {
+            return McpServer.ApiSearch(args.Str("query", ""), args.Int("limit", 40));
+        }
+        if (name == "zan_lookup_symbol" || name == "lookup_symbol") {
+            return McpServer.LookupSymbol(args.Str("name", ""), args.Int("limit", 10));
+        }
+        if (name == "zan_list_members" || name == "list_members") {
+            return McpServer.ListMembers(args.Str("type", ""), args.Str("filter", ""),
+                                        args.Int("limit", 80));
+        }
+        if (name == "zan_find_refs" || name == "find_refs") {
+            return McpServer.FindRefs(args.Str("name", ""), args.Int("limit", 30));
+        }
+        if (name == "zan_project_overview" || name == "project_overview") {
+            return McpServer.ProjectOverview(args.Int("limit", 40));
+        }
+        if (name == "zan_route_lookup" || name == "route_lookup") {
+            return McpServer.RouteLookup(args);
+        }
+        if (name == "zan_change_impact" || name == "change_impact") {
+            return McpServer.ChangeImpact(args.Str("symbol", ""),
+                                         args.Int("limit", 30));
+        }
+        if (name == "zan_read_context" || name == "read_context") {
+            return McpServer.ReadContext(args.Str("symbol", ""),
+                                        args.Int("before", 4),
+                                        args.Int("lines", 80));
+        }
+        if (name == "zan_orm_lookup" || name == "orm_lookup") {
+            return McpServer.OrmLookup(args);
+        }
+        if (name == "zan_refresh_index") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            if (!McpServer.ZanToolsAvailable()) { return McpServer.NoZancMsg(); }
+            return await McpServer.RefreshIndex();
+        }
+        if (name == "zan_example") { return McpServer.Example(args.Str("topic", "")); }
+        if (name == "zan_form_schema") {
+            return McpServer.FormSchema(args.Str("control", ""));
+        }
+        if (name == "zan_refresh_knowledge") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            return McpServer.RefreshKnowledge();
+        }
+        if (name == "zan_compile") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            if (!McpServer.ZanToolsAvailable()) { return McpServer.NoZancMsg(); }
+            return await McpServer.Compile(args.Str("filename", ""),
+                args.Str("content", ""));
+        }
+        if (name == "zan_build_project" || name == "build") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            if (!McpServer.ZanToolsAvailable()) { return McpServer.NoZancMsg(); }
+            return await McpServer.BuildProject(args.Str("entry", ""));
+        }
+        string text = McpServer.FileTool(name, args);
+        if (text != "") { return text; }
+        return "error: unknown tool '" + name + "'; call tools/list for the catalog";
+    }
+
+    static bool Mutable() { return !McpServer.readOnly; }
+    static string KnowledgeSeedPath() {
+        string sdkSeed = McpServer.knowledge + "/gallery.seed.json";
+        if (File.Exists(sdkSeed)) { return sdkSeed; }
+        return McpServer.root + "/tools/mcp_server/gallery.json";
+    }
+    static string KnowledgeDocPath() {
+        string sdkDoc = McpServer.knowledge + "/zform.doc.json";
+        if (File.Exists(sdkDoc)) { return sdkDoc; }
+        return McpServer.root + "/tools/mcp_server/zform.doc.json";
+    }
+    static bool KnowledgeInputs() {
+        return File.Exists(McpServer.KnowledgeSeedPath())
+            && File.Exists(McpServer.KnowledgeDocPath())
+            && Directory.Exists(McpServer.stdlibPath);
+    }
+
+    static long LatestMtime(string dir) {
+        if (!Directory.Exists(dir)) { return 0; }
+        long latest = FileInfo.GetLastWriteTime(dir);
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            long t = FileInfo.GetLastWriteTime(dir + "/" + fs[i]);
+            if (t > latest) { latest = t; }
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            long t = McpServer.LatestMtime(dir + "/" + ds[i]);
+            if (t > latest) { latest = t; }
+        }
+        return latest;
+    }
+
+    static void KnowledgeCheck(bool deep) {
+        McpServer.knowledgeFresh = false;
+        bool g = File.Exists(McpServer.galleryPath);
+        bool z = File.Exists(McpServer.formSchemaPath);
+        bool s = File.Exists(McpServer.indexPath);
+        if (!g || !z || !s) {
+            McpServer.knowledgeStatus = "missing knowledge artifact";
+            return;
+        }
+        long latest = FileInfo.GetLastWriteTime(
+            McpServer.KnowledgeSeedPath());
+        long doc = FileInfo.GetLastWriteTime(McpServer.KnowledgeDocPath());
+        if (doc > latest) { latest = doc; }
+        if (deep) {
+            long templates = McpServer.LatestMtime(
+                McpServer.root + "/templates");
+            long examples = McpServer.LatestMtime(
+                McpServer.root + "/examples");
+            long gui = McpServer.LatestMtime(McpServer.stdlibPath + "/Gui");
+            if (templates > latest) { latest = templates; }
+            if (examples > latest) { latest = examples; }
+            if (gui > latest) { latest = gui; }
+        }
+        if (FileInfo.GetLastWriteTime(McpServer.galleryPath) < latest
+            || FileInfo.GetLastWriteTime(McpServer.formSchemaPath) < latest) {
+            McpServer.knowledgeStatus = "knowledge artifacts are stale";
+            return;
+        }
+        // The symbol index is generated from source, so editing the compiler,
+        // the runtime or (deep) the stdlib makes it answer with stale lines.
+        // An SDK install has no src/, and then those walks simply find nothing.
+        long code = McpServer.LatestMtime(McpServer.root + "/src/compiler");
+        long rt = McpServer.LatestMtime(McpServer.root + "/src/runtime");
+        if (rt > code) { code = rt; }
+        if (deep) {
+            long sl = McpServer.LatestMtime(McpServer.stdlibPath);
+            if (sl > code) { code = sl; }
+        }
+        if (code > 0 && FileInfo.GetLastWriteTime(McpServer.indexPath) < code) {
+            McpServer.knowledgeStatus = "symbol index is stale; rebuild it "
+                + "with tools/repomap/RepoMap.zan";
+            return;
+        }
+        McpServer.knowledgeFresh = true;
+        McpServer.knowledgeStatus = "knowledge artifacts are fresh";
+    }
+
+    static string RefreshKnowledge() {
+        JsonValue o = JsonValue.NewObject();
+        if (!McpServer.KnowledgeInputs()) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(
+                "knowledge generation inputs are unavailable"));
+            return o.ToJson();
+        }
+        try {
+            GalleryResult g = GalleryIndex.Generate(McpServer.root,
+                McpServer.KnowledgeSeedPath());
+            ZformResult z = ZformSchema.Generate(McpServer.root,
+                McpServer.stdlibPath,
+                McpServer.KnowledgeDocPath());
+            File.WriteAllText(McpServer.galleryPath, g.json);
+            File.WriteAllText(McpServer.formSchemaPath, z.json);
+            McpServer.KnowledgeCheck(true);
+            o.Put("ok", JsonValue.NewBool(true));
+            o.Put("galleryEntries", JsonValue.NewNum(Convert.ToString(g.entries)));
+            o.Put("zformControls", JsonValue.NewNum(Convert.ToString(z.controls)));
+            o.Put("knowledgeFresh", JsonValue.NewBool(McpServer.knowledgeFresh));
+            JsonValue ws = JsonValue.NewArray();
+            for (int i = 0; i < g.warnings.Count; i = i + 1) {
+                ws.Append(JsonValue.NewStr(g.warnings[i]));
+            }
+            for (int i = 0; i < z.warnings.Count; i = i + 1) {
+                ws.Append(JsonValue.NewStr(z.warnings[i]));
+            }
+            o.Put("warnings", ws);
+            if (!File.Exists(McpServer.indexPath)) {
+                o.Put("symbols", JsonValue.NewStr(
+                    "symbols.json is absent; generate it with: zanc "
+                    + "tools/repomap/RepoMap.zan --auto-stdlib -o repomap.exe"
+                    + " && repomap.exe stdlib"));
+            } else {
+                o.Put("symbols", JsonValue.NewStr("symbols.json present"));
+            }
+        } catch (Exception e) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(e.Message));
+        }
+        return o.ToJson();
+    }
+    static string ReadOnlyMsg() { return "error: server is running --read-only"; }
+
+    static string NoZancMsg() {
+        return "error: no Zan toolchain next to this server (looked for "
+            + McpServer.zancPath + "); pass --zanc <path> to enable the zan_* tools";
+    }
+
+    /// The synchronous file tools. Returns "" when `name` is not one of them,
+    /// so CallTool can fall through to its own error message.
+    static string FileTool(string name, JsonValue args) {
+        string rel = args.Str("path", "");
+        if (name == "list_dir" || name == "list_files") {
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            if (!Directory.Exists(full)) {
+                return "error: directory not found: " + rel;
+            }
+            return McpServer.ListDoc(rel, full).ToJson();
+        }
+        if (name == "read_file") {
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            if (!File.Exists(full)) { return "error: file not found: " + rel; }
+            return McpServer.ReadDoc(rel, full, args);
+        }
+        if (name == "stat_path") {
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            return McpServer.StatDoc(rel, full).ToJson();
+        }
+        if (name == "find_files") {
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            return McpServer.FindFiles(rel, args);
+        }
+        if (name == "search_text") {
+            return McpServer.SearchText(rel, args);
+        }
+        if (name == "write_file") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            byte[] data = null;
+            if (args.Has("content_base64")) {
+                try {
+                    data = Encoding.Base64Decode(args.Str("content_base64", ""));
+                } catch (ArgumentException e) {
+                    return "error: content_base64 is not valid base64: " + e.Message;
+                }
+            } else {
+                data = args.Str("content", "").ToBytes();
+            }
+            string why = McpServer.WriteFile(full, data, args.Bool("append", false));
+            if (why != "") { return "error: " + why; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("ok", JsonValue.NewBool(true));
+            o.Put("path", JsonValue.NewStr(rel));
+            o.Put("bytes", JsonValue.NewNum(Convert.ToString(data.Length)));
+            return o.ToJson();
+        }
+        if (name == "edit_file") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            if (!File.Exists(full)) {
+                return "error: file not found: " + rel
+                    + "; use write_file to create it";
+            }
+            return McpServer.EditFile(rel, full, args);
+        }
+        if (name == "mkdir") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            Directory.CreateDirectoryRecursive(full);
+            if (!Directory.Exists(full)) {
+                return "error: could not create directory: " + rel;
+            }
+            return "ok: created " + rel;
+        }
+        if (name == "delete_path" || name == "delete") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            if (full == McpServer.root) {
+                return "error: refusing to delete the workspace root";
+            }
+            if (File.Exists(full)) {
+                File.Delete(full);
+                return "ok: deleted " + rel;
+            }
+            if (Directory.Exists(full)) {
+                if (!args.Bool("recursive", false)) {
+                    return "error: " + rel + " is a directory; pass recursive=true";
+                }
+                int n = McpServer.DeleteTree(full);
+                return "ok: deleted " + rel + " (" + Convert.ToString(n) + " entries)";
+            }
+            return "error: path not found: " + rel;
+        }
+        if (name == "move_path" || name == "move" || name == "copy_path"
+            || name == "copy") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string fromRel = args.Str("from", "");
+            string toRel = args.Str("to", "");
+            if (fromRel == "") { fromRel = rel; }
+            string from = McpServer.Resolve(fromRel);
+            string to = McpServer.Resolve(toRel);
+            if (from == "") { return McpServer.OutsideMsg(fromRel); }
+            if (to == "") { return McpServer.OutsideMsg(toRel); }
+            if (!File.Exists(from)) { return "error: file not found: " + fromRel; }
+            McpServer.EnsureParent(to);
+            bool moving = name == "move_path" || name == "move";
+            if (moving) { File.Move(from, to); } else { File.Copy(from, to); }
+            if (moving) { return "ok: moved " + fromRel + " -> " + toRel; }
+            return "ok: copied " + fromRel + " -> " + toRel;
+        }
+        return "";
+    }
+
+    static string OutsideMsg(string rel) {
+        return "error: path escapes the workspace root: '" + rel + "'";
+    }
+
+    // ---- file helpers -------------------------------------------------------
+
+    static JsonValue ListDoc(string rel, string full) {
+        List<string> dirs = Directory.GetDirectories(full);
+        List<string> files = Directory.GetFiles(full);
+        JsonValue entries = JsonValue.NewArray();
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            JsonValue e = JsonValue.NewObject();
+            e.Put("name", JsonValue.NewStr(dirs[i]));
+            e.Put("type", JsonValue.NewStr("dir"));
+            entries.Append(e);
+        }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            JsonValue e = JsonValue.NewObject();
+            e.Put("name", JsonValue.NewStr(files[i]));
+            e.Put("type", JsonValue.NewStr("file"));
+            e.Put("size", JsonValue.NewNum(
+                Convert.ToString(McpServer.SizeOf(full + "/" + files[i]))));
+            entries.Append(e);
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("type", JsonValue.NewStr("directory"));
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("count", JsonValue.NewNum(Convert.ToString(entries.Count())));
+        o.Put("entries", entries);
+        return o;
+    }
+
+    static JsonValue StatDoc(string rel, string full) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        bool isDir = Directory.Exists(full) && !File.Exists(full);
+        bool exists = isDir || File.Exists(full);
+        o.Put("exists", JsonValue.NewBool(exists));
+        if (!exists) { return o; }
+        o.Put("type", JsonValue.NewStr(McpServer.KindName(isDir)));
+        if (!isDir) {
+            o.Put("size", JsonValue.NewNum(Convert.ToString(McpServer.SizeOf(full))));
+        }
+        FileInfo fi = new FileInfo(full);
+        o.Put("modified", JsonValue.NewNum(Convert.ToString(fi.LastWriteTime())));
+        return o;
+    }
+
+    /// File size in bytes, 0 when the path does not exist.
+    static int SizeOf(string full) {
+        FileInfo fi = new FileInfo(full);
+        long n = fi.Length();
+        if (n < 0) { return 0; }
+        return (int)n;
+    }
+
+    static string KindName(bool isDir) {
+        if (isDir) { return "dir"; }
+        return "file";
+    }
+
+    /// read_file result: JSON with the content, plus enough metadata for the
+    /// caller to know whether it was truncated and how it was encoded. Binary
+    /// files are base64 so the JSON stays valid UTF-8 -- returning raw bytes
+    /// is what made clients fail with "'utf-8' codec can't decode byte".
+    static string ReadDoc(string rel, string full, JsonValue args) {
+        // A model looking at a grep hit wants "line 412 and its
+        // neighbourhood", not a byte offset it has to guess -- and guessing is
+        // what makes it read the whole file and then read it again.
+        if (args.Int("from_line", 0) > 0) {
+            return McpServer.ReadLinesDoc(rel, full, args);
+        }
+        int offset = args.Int("offset", 0);
+        int limit = args.Int("limit", 0);
+        byte[] data = McpServer.ReadSlice(full, offset, limit);
+        int n = data.Length;
+        int total = McpServer.SizeOf(full);
+        bool wantB64 = args.Str("encoding", "") == "base64";
+        bool text = McpServer.Utf8Valid(data, n);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("bytes", JsonValue.NewNum(Convert.ToString(n)));
+        o.Put("size", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("offset", JsonValue.NewNum(Convert.ToString(offset)));
+        o.Put("truncated", JsonValue.NewBool(offset + n < total));
+        if (text && !wantB64) {
+            o.Put("encoding", JsonValue.NewStr("text"));
+            o.Put("content", JsonValue.NewStr(data.ToStr(0, n)));
+        } else {
+            o.Put("encoding", JsonValue.NewStr("base64"));
+            o.Put("binary", JsonValue.NewBool(!text));
+            o.Put("content_base64",
+                JsonValue.NewStr(Encoding.Base64EncodeBytes(data, n)));
+        }
+        return o.ToJson();
+    }
+
+    /// A line window: `from_line` (1-based) plus `max_lines` (default 120),
+    /// optionally numbered so the model can cite path:line and come back to
+    /// the same place without re-reading.
+    static string ReadLinesDoc(string rel, string full, JsonValue args) {
+        int from = args.Int("from_line", 1);
+        int want = args.Int("max_lines", 120);
+        if (from < 1) { from = 1; }
+        if (want <= 0) { want = 120; }
+        bool numbered = args.Bool("numbered", true);
+        List<string> lines = File.ReadAllLines(full);
+        int last = from + want - 1;
+        if (last > lines.Count) { last = lines.Count; }
+        StringBuilder sb = new StringBuilder();
+        int i = from;
+        while (i <= last) {
+            if (numbered) { sb.Append(Convert.ToString(i) + "| "); }
+            sb.Append(lines[i - 1] + "\n");
+            i = i + 1;
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("encoding", JsonValue.NewStr("text"));
+        o.Put("lines", JsonValue.NewNum(Convert.ToString(lines.Count)));
+        o.Put("from_line", JsonValue.NewNum(Convert.ToString(from)));
+        o.Put("to_line", JsonValue.NewNum(Convert.ToString(last)));
+        o.Put("numbered", JsonValue.NewBool(numbered));
+        o.Put("truncated", JsonValue.NewBool(last < lines.Count));
+        o.Put("content", JsonValue.NewStr(sb.ToString()));
+        return o.ToJson();
+    }
+
+    /// Replaces `old` with `new` in one file, in place. This is the cheap way
+    /// to change code: no whole-file rewrite to send, so the model does not
+    /// have to read the file in full first just to be able to write it back.
+    /// An ambiguous or absent match is refused rather than guessed.
+    static string EditFile(string rel, string full, JsonValue args) {
+        string oldText = args.Str("old", "");
+        string newText = args.Str("new", "");
+        if (oldText == "") {
+            return "error: 'old' is required and must not be empty;"
+                + " use write_file to create a file";
+        }
+        if (oldText == newText) {
+            return "error: 'old' and 'new' are identical; nothing to do";
+        }
+        string text = File.ReadAllText(full);
+        int hits = McpServer.CountOccurrences(text, oldText);
+        if (hits == 0) {
+            return "error: 'old' does not occur in " + rel
+                + "; read the exact text first (read_file with from_line)"
+                + " and copy it byte for byte, whitespace included";
+        }
+        bool all = args.Bool("all", false);
+        if (hits > 1 && !all) {
+            return "error: 'old' occurs " + Convert.ToString(hits) + " times in "
+                + rel + "; extend it with surrounding lines until it is unique,"
+                + " or pass all=true to replace every occurrence";
+        }
+        int at = McpServer.Find(text, oldText);
+        int line = McpServer.LineOf(text, at);
+        string outText = "";
+        if (all) { outText = McpServer.ReplaceAll(text, oldText, newText); }
+        else {
+            outText = text.Substring(0, at) + newText
+                + text.Substring(at + oldText.Length,
+                    text.Length - at - oldText.Length);
+        }
+        string why = McpServer.WriteFile(full, outText.ToBytes(), false);
+        if (why != "") { return "error: " + why; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("path", JsonValue.NewStr(rel));
+        int done = 1;
+        if (all) { done = hits; }
+        o.Put("replacements", JsonValue.NewNum(Convert.ToString(done)));
+        o.Put("line", JsonValue.NewNum(Convert.ToString(line)));
+        o.Put("bytes", JsonValue.NewNum(Convert.ToString(outText.Length)));
+        return o.ToJson();
+    }
+
+    static int CountOccurrences(string hay, string needle) {
+        if (needle.Length == 0) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i + needle.Length <= hay.Length) {
+            int at = McpServer.Find(hay.Substring(i, hay.Length - i), needle);
+            if (at < 0) { break; }
+            n = n + 1;
+            i = i + at + needle.Length;
+        }
+        return n;
+    }
+
+    static string ReplaceAll(string hay, string needle, string with) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < hay.Length) {
+            int at = McpServer.Find(hay.Substring(i, hay.Length - i), needle);
+            if (at < 0) {
+                sb.Append(hay.Substring(i, hay.Length - i));
+                break;
+            }
+            sb.Append(hay.Substring(i, at));
+            sb.Append(with);
+            i = i + at + needle.Length;
+        }
+        return sb.ToString();
+    }
+
+    /// 1-based line number of byte offset `at`.
+    static int LineOf(string text, int at) {
+        int line = 1;
+        for (int i = 0; i < at && i < text.Length; i = i + 1) {
+            if ((text[i] & 255) == 10) { line = line + 1; }
+        }
+        return line;
+    }
+
+    // ---- skills -------------------------------------------------------------
+    // Progressive disclosure: skills_list is a cheap index (name + one line),
+    // skill_read pulls one body when the task actually calls for it. Sending
+    // every SKILL.md up front is what turns a 3k-token system prompt into a
+    // 30k one.
+
+    static List<string> SkillRoots() {
+        List<string> outs = new List<string>();
+        string ws = McpServer.root + "/.agents/skills";
+        if (Directory.Exists(ws)) { outs.Add(ws); }
+        if (McpServer.skillsDir != "" && Directory.Exists(McpServer.skillsDir)
+            && McpServer.skillsDir != ws) {
+            outs.Add(McpServer.skillsDir);
+        }
+        return outs;
+    }
+
+    static string SkillsList() {
+        JsonValue arr = JsonValue.NewArray();
+        List<string> roots = McpServer.SkillRoots();
+        for (int r = 0; r < roots.Count; r = r + 1) {
+            List<string> names = Directory.GetDirectories(roots[r]);
+            for (int i = 0; i < names.Count; i = i + 1) {
+                string md = roots[r] + "/" + names[i] + "/SKILL.md";
+                if (!File.Exists(md)) { continue; }
+                JsonValue o = JsonValue.NewObject();
+                o.Put("name", JsonValue.NewStr(names[i]));
+                o.Put("summary", JsonValue.NewStr(McpServer.SkillSummary(md)));
+                o.Put("bytes", JsonValue.NewNum(
+                    Convert.ToString(McpServer.SizeOf(md))));
+                string scope = "project";
+                if (r > 0 || roots[r] != McpServer.root + "/.agents/skills") {
+                    scope = "installed";
+                }
+                o.Put("scope", JsonValue.NewStr(scope));
+                arr.Append(o);
+            }
+        }
+        JsonValue res = JsonValue.NewObject();
+        res.Put("count", JsonValue.NewNum(Convert.ToString(arr.Count())));
+        res.Put("skills", arr);
+        res.Put("usage", JsonValue.NewStr(
+            "Read a skill only when its summary matches the task:"
+            + " skill_read(name). The bodies are deliberately not included"
+            + " here."));
+        if (arr.Count() == 0) {
+            res.Put("hint", JsonValue.NewStr(
+                "No skills found. They are <name>/SKILL.md directories under"
+                + " the workspace's .agents/skills, or under the server's"
+                + " --skills directory."));
+        }
+        return res.ToJson();
+    }
+
+    /// The skill's own one-line description: YAML front matter `description:`
+    /// when present, else the first line of prose.
+    static string SkillSummary(string md) {
+        List<string> lines = File.ReadAllLines(md);
+        int n = lines.Count;
+        if (n > 40) { n = 40; }
+        for (int i = 0; i < n; i = i + 1) {
+            string l = McpServer.Trim(lines[i]);
+            if (l.Length > 12 && l.Substring(0, 12) == "description:") {
+                return McpServer.Trim(l.Substring(12, l.Length - 12));
+            }
+        }
+        for (int i = 0; i < n; i = i + 1) {
+            string l = McpServer.Trim(lines[i]);
+            if (l == "" || l == "---") { continue; }
+            if ((l[0] & 255) == 35) { continue; }
+            if (l.Length > 200) { return l.Substring(0, 200); }
+            return l;
+        }
+        return "";
+    }
+
+    static string SkillRead(JsonValue args) {
+        string name = args.Str("name", "");
+        if (name == "") { return "error: 'name' is required; call skills_list"; }
+        if (McpServer.Find(name, "..") >= 0 || McpServer.Find(name, "/") >= 0
+            || McpServer.Find(name, "\\") >= 0) {
+            return "error: 'name' is a skill directory name, not a path";
+        }
+        string file = args.Str("file", "SKILL.md");
+        if (file == "") { file = "SKILL.md"; }
+        if (McpServer.Find(file, "..") >= 0 || McpServer.IsAbsolute(file)) {
+            return "error: 'file' must stay inside the skill directory";
+        }
+        List<string> roots = McpServer.SkillRoots();
+        for (int r = 0; r < roots.Count; r = r + 1) {
+            string full = roots[r] + "/" + name + "/" + file;
+            if (!File.Exists(full)) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(name));
+            o.Put("file", JsonValue.NewStr(file));
+            o.Put("bytes", JsonValue.NewNum(
+                Convert.ToString(McpServer.SizeOf(full))));
+            o.Put("content", JsonValue.NewStr(File.ReadAllText(full)));
+            return o.ToJson();
+        }
+        return "error: skill not found: " + name + "/" + file
+            + "; call skills_list for the catalogue";
+    }
+
+    /// Reads at most `maxRead` bytes starting at `offset`, byte-exactly (NUL
+    /// bytes included).
+    static byte[] ReadSlice(string full, int offset, int limit) {
+        int total = McpServer.SizeOf(full);
+        if (offset < 0) { offset = 0; }
+        int want = total - offset;
+        if (limit > 0 && limit < want) { want = limit; }
+        if (want > McpServer.maxRead) { want = McpServer.maxRead; }
+        if (want <= 0) { return new byte[0]; }
+        return File.ReadBytes(full, offset, want);
+    }
+
+    /// Writes `data` byte-exactly, creating parent directories. Returns "" on
+    /// success or the reason it failed.
+    static string WriteFile(string full, byte[] data, bool append) {
+        McpServer.EnsureParent(full);
+        try {
+            if (append) { File.AppendAllBytes(full, data); }
+            else { File.WriteAllBytes(full, data); }
+        } catch (IOException e) {
+            return e.Message;
+        }
+        return "";
+    }
+
+    static void EnsureParent(string full) {
+        string dir = McpServer.ParentOf(full);
+        if (dir == "") { return; }
+        if (Directory.Exists(dir)) { return; }
+        Directory.CreateDirectoryRecursive(dir);
+    }
+
+    static string ParentOf(string path) {
+        int cut = 0 - 1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int c = path[i] & 255;
+            if (c == 47 || c == 92) { cut = i; }
+        }
+        if (cut <= 0) { return ""; }
+        return path.Substring(0, cut);
+    }
+
+    /// Recursive delete; returns the number of entries removed.
+    static int DeleteTree(string dir) {
+        int n = 0;
+        List<string> files = Directory.GetFiles(dir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            File.Delete(dir + "/" + files[i]);
+            n = n + 1;
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            n = n + McpServer.DeleteTree(dir + "/" + subs[i]);
+        }
+        Directory.Delete(dir);
+        return n + 1;
+    }
+
+    // ---- find / search ------------------------------------------------------
+
+    /// find_files: walks the tree under `path` and returns the entries whose
+    /// name matches `glob` ('*' and '?' wildcards, matched on the file name)
+    /// or contains `contains`.
+    static string FindFiles(string rel, JsonValue args) {
+        string glob = args.Str("glob", "");
+        string contains = args.Str("contains", "");
+        int limit = args.Int("max_results", 500);
+        List<string> hits = new List<string>();
+        McpServer.Walk(rel, McpServer.Resolve(rel), glob, contains, limit, hits, 0);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            arr.Append(JsonValue.NewStr(hits[i]));
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("count", JsonValue.NewNum(Convert.ToString(hits.Count)));
+        o.Put("truncated", JsonValue.NewBool(hits.Count >= limit));
+        o.Put("files", arr);
+        return o.ToJson();
+    }
+
+    static void Walk(string rel, string full, string glob, string contains,
+                     int limit, List<string> hits, int depth) {
+        if (hits.Count >= limit) { return; }
+        if (depth > 32) { return; }
+        if (!Directory.Exists(full)) { return; }
+        List<string> files = Directory.GetFiles(full);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            if (hits.Count >= limit) { return; }
+            string name = files[i];
+            bool hit = true;
+            if (glob != "") { hit = McpServer.GlobMatch(glob, name); }
+            if (hit && contains != "") {
+                hit = McpServer.Find(name.ToLower(), contains.ToLower()) >= 0;
+            }
+            if (hit) { hits.Add(McpServer.JoinRel(rel, name)); }
+        }
+        List<string> dirs = Directory.GetDirectories(full);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            string name = dirs[i];
+            // Skip the caches every workspace has; they drown real results.
+            if (name == ".git" || name == "node_modules" || name == "build"
+                || name == "dist" || name == "__pycache__") {
+                continue;
+            }
+            McpServer.Walk(McpServer.JoinRel(rel, name), full + "/" + name,
+                glob, contains, limit, hits, depth + 1);
+        }
+    }
+
+    static string JoinRel(string rel, string name) {
+        if (rel == "" || rel == ".") { return name; }
+        return rel + "/" + name;
+    }
+
+    /// Glob with '*' (any run) and '?' (one byte). Iterative with a single
+    /// backtrack point, so a pattern full of stars cannot blow the stack.
+    static bool GlobMatch(string pat, string text) {
+        int p = 0;
+        int t = 0;
+        int star = 0 - 1;
+        int mark = 0;
+        while (t < text.Length) {
+            if (p < pat.Length
+                && ((pat[p] & 255) == 63 || (pat[p] & 255) == (text[t] & 255))) {
+                p = p + 1;
+                t = t + 1;
+            } else if (p < pat.Length && (pat[p] & 255) == 42) {
+                star = p;
+                mark = t;
+                p = p + 1;
+            } else if (star >= 0) {
+                p = star + 1;
+                mark = mark + 1;
+                t = mark;
+            } else {
+                return false;
+            }
+        }
+        while (p < pat.Length && (pat[p] & 255) == 42) { p = p + 1; }
+        return p == pat.Length;
+    }
+
+    /// search_text: literal, optionally case-insensitive substring search over
+    /// the text files under `path`, reporting file/line/text like grep.
+    static string SearchText(string rel, JsonValue args) {
+        string query = args.Str("query", "");
+        if (query == "") { return "error: 'query' is required"; }
+        string glob = args.Str("glob", "");
+        int limit = args.Int("max_results", 200);
+        bool fold = args.Bool("ignore_case", true);
+        List<string> files = new List<string>();
+        McpServer.Walk(rel, McpServer.Resolve(rel), glob, "", 20000, files, 0);
+        string needle = query;
+        if (fold) { needle = query.ToLower(); }
+        JsonValue matches = JsonValue.NewArray();
+        int scanned = 0;
+        for (int i = 0; i < files.Count; i = i + 1) {
+            if (matches.Count() >= limit) { break; }
+            string full = McpServer.Resolve(files[i]);
+            if (full == "") { continue; }
+            if (McpServer.SizeOf(full) > 4194304) { continue; }
+            // Read as bytes and skip anything that is not text: a binary file
+            // read through ReadAllText stops at its first NUL, which would
+            // silently search only its first few bytes.
+            byte[] raw = McpServer.ReadSlice(full, 0, 0);
+            if (!McpServer.Utf8Valid(raw, raw.Length)) { continue; }
+            string body = raw.ToStr(0, raw.Length);
+            scanned = scanned + 1;
+            List<string> lines = Process.SplitLines(body);
+            for (int k = 0; k < lines.Count; k = k + 1) {
+                if (matches.Count() >= limit) { break; }
+                string hay = lines[k];
+                if (fold) { hay = hay.ToLower(); }
+                if (McpServer.Find(hay, needle) < 0) { continue; }
+                JsonValue m = JsonValue.NewObject();
+                m.Put("file", JsonValue.NewStr(files[i]));
+                m.Put("line", JsonValue.NewNum(Convert.ToString(k + 1)));
+                m.Put("text", JsonValue.NewStr(McpServer.Clip(lines[k], 400)));
+                matches.Append(m);
+            }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("query", JsonValue.NewStr(query));
+        o.Put("filesScanned", JsonValue.NewNum(Convert.ToString(scanned)));
+        o.Put("count", JsonValue.NewNum(Convert.ToString(matches.Count())));
+        o.Put("truncated", JsonValue.NewBool(matches.Count() >= limit));
+        o.Put("matches", matches);
+        return o.ToJson();
+    }
+
+    static string Clip(string s, int n) {
+        if (s.Length <= n) { return s; }
+        return s.Substring(0, n) + "...";
+    }
+
+    // ---- run_command --------------------------------------------------------
+
+    /// Runs a shell command in the workspace (or `cwd` under it) and returns
+    /// {ok, exitCode, command, stdout}. The exit code is reported rather than
+    /// guessed from the output.
+    static async string RunCommand(JsonValue args) {
+        if (!McpServer.CanExec()) {
+            return "error: command execution is disabled on this server";
+        }
+        string cmd = args.Str("command", "");
+        if (cmd == "") { return "error: 'command' is required"; }
+        string cwd = McpServer.root;
+        string cwdRel = args.Str("cwd", "");
+        if (cwdRel != "") {
+            cwd = McpServer.Resolve(cwdRel);
+            if (cwd == "") { return McpServer.OutsideMsg(cwdRel); }
+        }
+        string shell = args.Str("shell", "");
+        string full = McpServer.ShellWrap(shell, cmd, cwd);
+        ProcessResult res = await McpServer.RunProcessAsync(full);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < res.lines.Count; i = i + 1) {
+            sb.Append(McpServer.StripAnsi(res.lines[i]));
+            sb.Append("\n");
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(res.exitCode == 0));
+        o.Put("exitCode", JsonValue.NewNum(Convert.ToString(res.exitCode)));
+        o.Put("command", JsonValue.NewStr(cmd));
+        o.Put("cwd", JsonValue.NewStr(cwd));
+        o.Put("stdout", JsonValue.NewStr(sb.ToString()));
+        return o.ToJson();
+    }
+
+    /// Builds the platform command line: the working directory is applied by
+    /// the shell itself so no global chdir is needed (the server is
+    /// multi-connection and a process-wide cwd would race).
+    static string ShellWrap(string shell, string cmd, string cwd) {
+        #if WINDOWS
+        if (shell == "powershell" || shell == "pwsh") {
+            return shell + " -NoProfile -NonInteractive -Command \"Set-Location -LiteralPath '"
+                + cwd + "'; " + cmd + "\"";
+        }
+        return "cd /d \"" + cwd + "\" && " + cmd;
+        #else
+        string sh = shell;
+        if (sh == "" || sh == "cmd" || sh == "powershell") { sh = "sh"; }
+        return sh + " -c 'cd \"" + cwd + "\" && " + cmd + "'";
+        #endif
+    }
+
+    // ---- non-blocking process execution ------------------------------------
+    // Process.Capture blocks its calling thread, which would stall the whole
+    // single-threaded scheduler for the duration of the command. The capture
+    // therefore runs on a detached worker thread (Thread.Start needs a
+    // non-capturing method group, hence the static job queue) while the
+    // request coroutine waits with async polls.
+
+    class PendingJob {
+        int id;
+        string cmd;
+        bool started;
+        bool done;
+        ProcessResult result;
+    }
+
+    static List<PendingJob> jobs;
+    static nint jobLock;
+    static int jobSeq;
+
+    static void InitJobs() {
+        McpServer.jobs = new List<PendingJob>();
+        McpServer.jobLock = Mutex.Create();
+        McpServer.jobSeq = 0;
+    }
+
+    static async ProcessResult RunProcessAsync(string cmd) {
+        PendingJob job = new PendingJob();
+        McpServer.jobSeq = McpServer.jobSeq + 1;
+        job.id = McpServer.jobSeq;
+        job.cmd = cmd;
+        job.started = false;
+        job.done = false;
+        job.result = null;
+        Mutex.Lock(McpServer.jobLock);
+        McpServer.jobs.Add(job);
+        Mutex.Unlock(McpServer.jobLock);
+        if (!Thread.Start(McpServer.ProcessWorker)) {
+            // Rare failure to spawn: run inline rather than hang the request.
+            job.result = Process.Capture(job.cmd);
+            job.done = true;
+        }
+        while (!job.done) { await Task.Delay(10); }
+        Mutex.Lock(McpServer.jobLock);
+        for (int i = 0; i < McpServer.jobs.Count; i = i + 1) {
+            if (McpServer.jobs[i].id == job.id) {
+                McpServer.jobs.RemoveAt(i);
+                break;
+            }
+        }
+        Mutex.Unlock(McpServer.jobLock);
+        if (job.result == null) { job.result = new ProcessResult(); }
+        if (job.result.lines == null) { job.result.lines = new List<string>(); }
+        return job.result;
+    }
+
+    /// Detached-thread entry (non-capturing). Claims the oldest unstarted job,
+    /// runs it, marks it done; exits when the queue is empty.
+    static void ProcessWorker() {
+        while (true) {
+            PendingJob job = null;
+            Mutex.Lock(McpServer.jobLock);
+            for (int i = 0; i < McpServer.jobs.Count; i = i + 1) {
+                if (!McpServer.jobs[i].started) {
+                    McpServer.jobs[i].started = true;
+                    job = McpServer.jobs[i];
+                    break;
+                }
+            }
+            Mutex.Unlock(McpServer.jobLock);
+            if (job == null) { return; }
+            job.result = Process.Capture(job.cmd);
+            job.done = true;
+        }
+    }
+
+    // ---- optional Zan tools -------------------------------------------------
+
+    static string ApiSearch(string query, int limit) {
+        if (query == "") { return "error: 'query' is required"; }
+        if (!File.Exists(McpServer.indexPath)) {
+            return "error: symbol index not found at " + McpServer.indexPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe stdlib";
+        }
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> cands = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (cands.Count >= McpServer.CandCap()) { break; }
+            string line = lines[i];
+            if (McpServer.Find(line, "\"name\"") < 0) { continue; }
+            if (!McpServer.TokensMatch(line, query)) { continue; }
+            string trimmed = line;
+            if (trimmed.Length > 0
+                && trimmed.Substring(trimmed.Length - 1, 1) == ",") {
+                trimmed = trimmed.Substring(0, trimmed.Length - 1);
+            }
+            JsonValue rec = McpServer.ParseBody(trimmed);
+            if (rec == null) { continue; }
+            cands.Add(rec);
+        }
+        JsonValue results = McpServer.RankedTake(cands, limit);
+        int found = results.Count();
+        JsonValue o = JsonValue.NewObject();
+        o.Put("query", JsonValue.NewStr(query));
+        o.Put("count", JsonValue.NewNum(Convert.ToString(found)));
+        o.Put("results", results);
+        if (found == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "no match; try a shorter symbol fragment, e.g. 'Button'"));
+        }
+        return o.ToJson();
+    }
+
+    /// Exact definition lookup: "File", "File.ReadAllText" or a bare member
+    /// name. Returns the records themselves (kind/file/line/signature/summary)
+    /// so the caller can jump to the definition without opening a file.
+    static string LookupSymbol(string name, int limit) {
+        if (name == "") { return "error: 'name' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string lower = name.ToLower();
+        string dotted = "." + lower;
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> exactRecs = new List<JsonValue>();
+        List<JsonValue> memberRecs = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (exactRecs.Count + memberRecs.Count >= McpServer.CandCap()) { break; }
+            // Compare the name field textually first: parsing 45k records to
+            // answer one lookup would cost seconds per call.
+            string full = McpServer.NameField(lines[i]);
+            if (full == "") { continue; }
+            bool isExact = full == lower;
+            bool isMember = full.Length > dotted.Length
+                && full.Substring(full.Length - dotted.Length, dotted.Length) == dotted;
+            if (!isExact && !isMember) { continue; }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            if (isExact) { exactRecs.Add(rec); } else { memberRecs.Add(rec); }
+        }
+        JsonValue exact = McpServer.RankedTake(exactRecs, limit);
+        JsonValue member = McpServer.RankedTake(memberRecs, limit);
+        int found = exact.Count() + member.Count();
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(name));
+        o.Put("exact", exact);
+        o.Put("members", member);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(found)));
+        if (found == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "no exact match; try zan_api_search for fuzzy fragments"));
+        }
+        return o.ToJson();
+    }
+
+    /// Every member declared on one type, with signatures and line numbers --
+    /// the reference page for a single type instead of a whole namespace.
+    static string ListMembers(string type, string filter, int limit) {
+        if (type == "") { return "error: 'type' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string owner = type.ToLower();
+        string prefix = owner + ".";
+        string want = filter.ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> declCands = new List<JsonValue>();
+        List<JsonValue> memberCands = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (memberCands.Count >= McpServer.CandCap()) { break; }
+            string lower = McpServer.NameField(lines[i]);
+            if (lower == "") { continue; }
+            bool isSelf = lower == owner;
+            if (!isSelf) {
+                if (lower.Length <= prefix.Length) { continue; }
+                if (lower.Substring(0, prefix.Length) != prefix) { continue; }
+                if (want != "" && McpServer.Find(lower, want) < 0) { continue; }
+            }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            if (isSelf) { declCands.Add(rec); } else { memberCands.Add(rec); }
+        }
+        // One name, several declarations: answer for the most authoritative one
+        // and drop the members of the copies, so a stdlib type is never
+        // described by a test fixture of the same name.
+        JsonValue decls = McpServer.RankedTake(declCands, 1);
+        bool haveDecl = decls.Count() > 0;
+        JsonValue decl = JsonValue.NewObject();
+        int best = McpServer.RANK_MAX();
+        if (haveDecl) {
+            decl = decls.At(0);
+            best = McpServer.SourceRank(decl.Str("file", ""));
+        } else {
+            for (int i = 0; i < memberCands.Count; i = i + 1) {
+                int r = McpServer.SourceRank(memberCands[i].Str("file", ""));
+                if (r < best) { best = r; }
+            }
+        }
+        JsonValue members = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < memberCands.Count; i = i + 1) {
+            JsonValue rec = memberCands[i];
+            if (McpServer.SourceRank(rec.Str("file", "")) != best) { continue; }
+            total = total + 1;
+            if (members.Count() >= limit) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("name", JsonValue.NewStr(rec.Str("name", "")));
+            row.Put("kind", JsonValue.NewStr(rec.Str("kind", "")));
+            row.Put("sig", JsonValue.NewStr(rec.Str("sig", "")));
+            row.Put("file", JsonValue.NewStr(rec.Str("file", "")));
+            row.Put("line", JsonValue.NewNum(Convert.ToString(rec.Int("line", 0))));
+            string doc = rec.Str("doc", "");
+            if (doc != "") { row.Put("doc", JsonValue.NewStr(doc)); }
+            members.Append(row);
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("type", JsonValue.NewStr(type));
+        if (haveDecl) { o.Put("declaration", decl); }
+        o.Put("memberCount", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("returned", JsonValue.NewNum(Convert.ToString(members.Count())));
+        o.Put("members", members);
+        if (total == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "unknown type; call zan_api_search to find the exact name"));
+        } else if (members.Count() < total) {
+            o.Put("hint", JsonValue.NewStr(
+                "truncated; narrow with 'filter' or raise 'limit'"));
+        }
+        return o.ToJson();
+    }
+
+    /// Impact of a change: where a name is declared, which lines mention it,
+    /// which types inherit it and how much of that lives in tests.
+    ///
+    /// The reference sites are TEXT-LEVEL evidence produced by RepoMap: an
+    /// identifier match with the declaration lines removed. They are not
+    /// overload-resolved and not type-checked, so treat them as candidates to
+    /// review, not as a compiler call graph. `subtypes` comes from declared
+    /// base lists and is exact.
+    static string FindRefs(string name, int limit) {
+        if (name == "") { return "error: 'name' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: reference index not found at " + McpServer.refsPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe .";
+        }
+        string simple = McpServer.AfterLastDot(name).ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) != simple) { continue; }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(rec.Str("name", "")));
+            o.Put("kinds", rec.Get("kinds"));
+            o.Put("owners", rec.Get("owners"));
+            o.Put("defs", rec.Get("defs"));
+            o.Put("defCount", JsonValue.NewNum(
+                Convert.ToString(rec.Int("defCount", 0))));
+            o.Put("refCount", JsonValue.NewNum(
+                Convert.ToString(rec.Int("refCount", 0))));
+            o.Put("testRefs", JsonValue.NewNum(
+                Convert.ToString(rec.Int("testRefs", 0))));
+            o.Put("refs", McpServer.HeadOf(rec.Get("refs"), limit));
+            o.Put("subtypes", rec.Get("subtypes"));
+            o.Put("evidence", JsonValue.NewStr(
+                "text-level identifier matches minus declaration lines; not"
+                + " overload-resolved. 'subtypes' comes from declared bases."));
+            return o.ToJson();
+        }
+        JsonValue miss = JsonValue.NewObject();
+        miss.Put("name", JsonValue.NewStr(name));
+        miss.Put("refCount", JsonValue.NewNum("0"));
+        miss.Put("hint", JsonValue.NewStr(
+            "no indexed name matches; the index keys simple names"
+            + " (\"ReadAllText\", not \"File.ReadAllText\")"));
+        return miss.ToJson();
+    }
+
+    /// First `limit` entries of a JSON string array, or an empty array.
+    static JsonValue HeadOf(JsonValue arr, int limit) {
+        JsonValue outp = JsonValue.NewArray();
+        if (arr == null) { return outp; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            if (i >= limit) { break; }
+            outp.Append(JsonValue.NewStr(arr.At(i).AsString("")));
+        }
+        return outp;
+    }
+
+    static string AfterLastDot(string s) {
+        int cut = -1;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s.Substring(i, 1) == ".") { cut = i; }
+        }
+        if (cut < 0) { return s; }
+        return s.Substring(cut + 1, s.Length - cut - 1);
+    }
+
+    /// The lower-cased "name" field of an index line, read straight out of the
+    /// text so a scan over the whole index costs no JSON parsing. Empty when
+    /// the line carries no name (the array brackets).
+    static string NameField(string line) {
+        int key = McpServer.Find(line, "\"name\":\"");
+        if (key < 0) { return ""; }
+        int from = key + 8;
+        int end = from;
+        while (end < line.Length && (line[end] & 255) != 34) { end = end + 1; }
+        if (end >= line.Length) { return ""; }
+        return line.Substring(from, end - from).ToLower();
+    }
+
+    /// Parses one line of a RepoMap artefact (records are one per line, with a
+    /// trailing comma) and returns null for the array's own brackets.
+    static JsonValue IndexRecord(string line) {
+        string t = line;
+        if (McpServer.Find(t, "\"name\"") < 0) { return null; }
+        if (t.Length > 0 && t.Substring(t.Length - 1, 1) == ",") {
+            t = t.Substring(0, t.Length - 1);
+        }
+        return McpServer.ParseBody(t);
+    }
+
+    /// How authoritative a definition's location is (0 = best). The same name
+    /// often exists both in the library and in a test fixture; answering a
+    /// lookup with the fixture sends the caller to the wrong file, so records
+    /// are emitted library-first.
+    static int SourceRank(string file) {
+        if (McpServer.Starts(file, "stdlib/")) { return 0; }
+        if (McpServer.Starts(file, "src/")) { return 0; }
+        if (McpServer.Starts(file, "tools/")) { return 1; }
+        if (McpServer.Starts(file, "templates/")) { return 2; }
+        if (McpServer.Starts(file, "examples/")) { return 2; }
+        if (McpServer.Starts(file, "tests/")) { return 3; }
+        return 2;
+    }
+
+    static int RANK_MAX() { return 3; }
+
+    /// Candidates to collect before ranking. A lookup keeps only `limit`
+    /// records, but it has to see the duplicates to pick the best one; the cap
+    /// bounds the work when a name appears everywhere.
+    static int CandCap() { return 400; }
+
+    static bool Starts(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(0, p.Length) == p;
+    }
+
+    /// The first `limit` records, best source rank first, scan order within a
+    /// rank.
+    static JsonValue RankedTake(List<JsonValue> recs, int limit) {
+        JsonValue outp = JsonValue.NewArray();
+        for (int r = 0; r <= McpServer.RANK_MAX(); r = r + 1) {
+            for (int i = 0; i < recs.Count; i = i + 1) {
+                if (outp.Count() >= limit) { return outp; }
+                JsonValue rec = recs[i];
+                if (McpServer.SourceRank(rec.Str("file", "")) != r) { continue; }
+                outp.Append(rec);
+            }
+        }
+        return outp;
+    }
+
+    static string NoIndex() {
+        return "error: symbol index not found at " + McpServer.indexPath
+            + "; generate it with: zanc tools/repomap/RepoMap.zan"
+            + " --auto-stdlib -o repomap.exe && repomap.exe .";
+    }
+
+    /// Every space-separated token of `query` must appear somewhere in the
+    /// record, case-insensitively.
+    static bool TokensMatch(string line, string query) {
+        string l = line.ToLower();
+        string q = query.ToLower();
+        int start = 0;
+        int i = 0;
+        while (i <= q.Length) {
+            bool end = i == q.Length;
+            bool space = false;
+            if (!end) {
+                int c = q[i] & 255;
+                space = c == 32 || c == 9;
+            }
+            if (end || space) {
+                if (i > start) {
+                    if (McpServer.Find(l, q.Substring(start, i - start)) < 0) {
+                        return false;
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // ---- project semantic index (.zanmap) -----------------------------------
+    // routes.json / entities.json are written by System.Compiler.GenIndex,
+    // which derives them from the compiler's own unit metadata: the answers
+    // here are the routes the app really registers and the columns the ORM
+    // really binds, not a regex guess over the sources.
+
+    static string IndexMissingMsg(string rel) {
+        return "error: " + rel + " has not been generated for this workspace;"
+            + " call zan_refresh_index (or compile with ZAN_INDEX_DIR=<root>"
+            + "/.zanmap set) to build it";
+    }
+
+    /// Case-insensitive "does this record's field contain the query" test.
+    static bool FieldHas(JsonValue rec, string key, string needle) {
+        return McpServer.Find(rec.Str(key, "").ToLower(), needle) >= 0;
+    }
+
+    /// Routes matching a query, with the metadata an edit actually needs:
+    /// verb, URL, action name, controller, Perm/auth gate and file:line.
+    static string RouteLookup(JsonValue args) {
+        if (!File.Exists(McpServer.routesIndexPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/routes.json");
+        }
+        JsonValue all = McpServer.ParseBody(
+            File.ReadAllText(McpServer.routesIndexPath));
+        if (all == null || !all.IsArray()) {
+            return "error: .zanmap/routes.json is not a JSON array";
+        }
+        string q = args.Str("query", "").ToLower();
+        string verb = args.Str("method", "").ToUpper();
+        bool unmarked = args.Bool("unmarked_perm", false);
+        int limit = args.Int("limit", 40);
+        JsonValue hits = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            JsonValue r = all.At(i);
+            if (verb != "" && r.Str("method", "") != verb) { continue; }
+            if (unmarked && r.Str("perm", "") != "") { continue; }
+            if (q != "" && !McpServer.FieldHas(r, "path", q)
+                && !McpServer.FieldHas(r, "action", q)
+                && !McpServer.FieldHas(r, "controller", q)
+                && !McpServer.FieldHas(r, "module", q)
+                && !McpServer.FieldHas(r, "title", q)) {
+                continue;
+            }
+            total = total + 1;
+            if (hits.Count() < limit) { hits.Append(r); }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("routes", hits);
+        o.Put("matched", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("indexed", JsonValue.NewNum(Convert.ToString(all.Count())));
+        o.Put("truncated", JsonValue.NewBool(total > hits.Count()));
+        return o.ToJson();
+    }
+
+    /// ORM entities matching a query: physical table, every column with its
+    /// type/nullability, navigations, indexes, and the generated facade names
+    /// to write against (`__DbQ_<E>` etc.).
+    static string OrmLookup(JsonValue args) {
+        if (!File.Exists(McpServer.entitiesIndexPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/entities.json");
+        }
+        JsonValue all = McpServer.ParseBody(
+            File.ReadAllText(McpServer.entitiesIndexPath));
+        if (all == null || !all.IsArray()) {
+            return "error: .zanmap/entities.json is not a JSON array";
+        }
+        string q = args.Str("query", "").ToLower();
+        string col = args.Str("column", "").ToLower();
+        int limit = args.Int("limit", 10);
+        JsonValue hits = JsonValue.NewArray();
+        JsonValue names = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            JsonValue e = all.At(i);
+            names.Append(JsonValue.NewStr(e.Str("name", "")
+                + " -> " + e.Str("table", "")));
+            if (q != "" && !McpServer.FieldHas(e, "name", q)
+                && !McpServer.FieldHas(e, "table", q)
+                && !McpServer.FieldHas(e, "ns", q)) {
+                continue;
+            }
+            if (col != "" && !McpServer.EntityHasColumn(e, col)) { continue; }
+            total = total + 1;
+            if (hits.Count() < limit) { hits.Append(e); }
+        }
+        JsonValue o = JsonValue.NewObject();
+        // With no filter the useful answer is the map, not 24 full schemas.
+        if (q == "" && col == "") {
+            o.Put("entities", names);
+            o.Put("usage", JsonValue.NewStr(
+                "pass query=<entity|table> for the full column list, or"
+                + " column=<name> to find which entities carry a column"));
+            return o.ToJson();
+        }
+        o.Put("entities", hits);
+        o.Put("matched", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("indexed", JsonValue.NewNum(Convert.ToString(all.Count())));
+        o.Put("truncated", JsonValue.NewBool(total > hits.Count()));
+        return o.ToJson();
+    }
+
+    static bool EntityHasColumn(JsonValue e, string needle) {
+        JsonValue cols = e.Get("columns");
+        if (cols == null) { return false; }
+        for (int i = 0; i < cols.Count(); i = i + 1) {
+            JsonValue c = cols.At(i);
+            if (McpServer.FieldHas(c, "column", needle)) { return true; }
+            if (McpServer.FieldHas(c, "field", needle)) { return true; }
+        }
+        return false;
+    }
+
+    /// The whole project in one call: how big it is, what it exposes (routes
+    /// per module and per verb), what it persists (entity -> table) and where
+    /// the RBAC holes are. Reads only .zanmap, so it replaces a tree walk plus
+    /// a dozen opening reads at the start of a task.
+    static string ProjectOverview(int limit) {
+        if (!File.Exists(McpServer.indexManifestPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/index.json");
+        }
+        JsonValue man = McpServer.ParseBody(
+            File.ReadAllText(McpServer.indexManifestPath));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("root", JsonValue.NewStr(McpServer.root));
+        if (man != null) {
+            o.Put("generatedBy", man.Get("generatedBy"));
+            o.Put("sourceFiles", man.Get("sourceFiles"));
+        }
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue mods = JsonValue.NewObject();
+        JsonValue verbs = JsonValue.NewObject();
+        JsonValue unmarked = JsonValue.NewArray();
+        int unmarkedTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null) { continue; }
+            McpServer.Bump(mods, r.Str("module", ""));
+            McpServer.Bump(verbs, r.Str("method", ""));
+            // Only a Grant-gated action needs Perm bits; Login/None actions
+            // legitimately carry none, and reporting them as holes would make
+            // the number useless.
+            if (r.Str("perm", "") == "" && r.Str("auth", "") == "Grant") {
+                unmarkedTotal = unmarkedTotal + 1;
+                if (unmarked.Count() < limit) {
+                    unmarked.Append(JsonValue.NewStr(r.Str("action", "")));
+                }
+            }
+        }
+        JsonValue tables = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            if (tables.Count() >= limit) { break; }
+            tables.Append(JsonValue.NewStr(e.Str("name", "") + " -> "
+                + e.Str("table", "")));
+        }
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes.Count())));
+        o.Put("routesByModule", mods);
+        o.Put("routesByMethod", verbs);
+        o.Put("entities", JsonValue.NewNum(Convert.ToString(ents.Count())));
+        o.Put("tables", tables);
+        // An authorized action with no Perm is the failure mode the RBAC gate
+        // reports at startup, so it belongs in the overview rather than in a
+        // separate audit call.
+        o.Put("authorizedWithoutPerm",
+            JsonValue.NewNum(Convert.ToString(unmarkedTotal)));
+        o.Put("authorizedWithoutPermSample", unmarked);
+        o.Put("next", JsonValue.NewStr(
+            "zan_route_lookup for an URL or action, zan_orm_lookup for an"
+            + " entity's columns and facades, zan_change_impact before"
+            + " editing a shared symbol, zan_read_context to see one"
+            + " definition"));
+        return o.ToJson();
+    }
+
+    /// `.zanmap` artefact as an array, or an empty array when it is missing or
+    /// malformed: an overview must still answer what it does know.
+    static JsonValue IndexArray(string path) {
+        if (!File.Exists(path)) { return JsonValue.NewArray(); }
+        JsonValue all = McpServer.ParseBody(File.ReadAllText(path));
+        if (all == null || !all.IsArray()) { return JsonValue.NewArray(); }
+        return all;
+    }
+
+    /// Counts `key` in a JSON object used as a counter map. Empty keys are
+    /// bucketed as "(none)" so a missing module is visible instead of silent.
+    static void Bump(JsonValue map, string key) {
+        string k = key;
+        if (k == "") { k = "(none)"; }
+        int n = 0;
+        if (map.Has(k)) {
+            JsonValue cur = map.Get(k);
+            if (cur != null) { n = cur.AsInt(0); }
+        }
+        map.Set(k, JsonValue.NewNum(Convert.ToString(n + 1)));
+    }
+
+    /// "What breaks if I change this": the declaration sites of a name, the
+    /// files that mention it, and -- the part a grep cannot give you -- the
+    /// routes and entities those files own, so the answer is "these 3 URLs and
+    /// this table" rather than "47 hits".
+    ///
+    /// Reference sites come from RepoMap's text-level index (identifier
+    /// matches, not overload-resolved), so they are candidates to review; the
+    /// route/entity attribution is exact, being derived from unit metadata.
+    static string ChangeImpact(string name, int limit) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: reference index not found at " + McpServer.refsPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe .";
+        }
+        string simple = McpServer.AfterLastDot(name).ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        JsonValue rec = null;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) != simple) { continue; }
+            rec = McpServer.IndexRecord(lines[i]);
+            if (rec != null) { break; }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        if (rec == null) {
+            o.Put("hint", JsonValue.NewStr(
+                "no indexed name matches; the index keys simple names"
+                + " (\"OpenRouterKey\", not \"Model.OpenRouterKey\")"));
+            return o.ToJson();
+        }
+        JsonValue files = JsonValue.NewObject();
+        McpServer.CountSites(files, rec.Get("defs"));
+        McpServer.CountSites(files, rec.Get("refs"));
+        o.Put("defs", rec.Get("defs"));
+        o.Put("refCount", JsonValue.NewNum(
+            Convert.ToString(rec.Int("refCount", 0))));
+        o.Put("testRefs", JsonValue.NewNum(
+            Convert.ToString(rec.Int("testRefs", 0))));
+        o.Put("files", files);
+        o.Put("subtypes", rec.Get("subtypes"));
+
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue hitRoutes = JsonValue.NewArray();
+        int routeTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null || !files.Has(r.Str("file", ""))) { continue; }
+            routeTotal = routeTotal + 1;
+            if (hitRoutes.Count() >= limit) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("method", r.Get("method"));
+            row.Put("path", r.Get("path"));
+            row.Put("action", r.Get("action"));
+            row.Put("perm", r.Get("perm"));
+            hitRoutes.Append(row);
+        }
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue hitEnts = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            bool byFile = files.Has(e.Str("file", ""));
+            bool byName = e.Str("name", "").ToLower() == simple;
+            if (!byFile && !byName) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("name", e.Get("name"));
+            row.Put("table", e.Get("table"));
+            row.Put("file", e.Get("file"));
+            hitEnts.Append(row);
+        }
+        o.Put("routes", hitRoutes);
+        o.Put("routesAffected", JsonValue.NewNum(
+            Convert.ToString(routeTotal)));
+        o.Put("entities", hitEnts);
+        o.Put("evidence", JsonValue.NewStr(
+            "'files' and 'refCount' are text-level identifier matches (review"
+            + " them); 'routes'/'entities' are exact, derived from the"
+            + " compiler's unit metadata for the files that mention the name"));
+        return o.ToJson();
+    }
+
+    /// Adds each "file:line" site of `arr` to a per-file counter map.
+    static void CountSites(JsonValue map, JsonValue arr) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            string site = arr.At(i).AsString("");
+            int cut = site.LastIndexOf(":");
+            if (cut > 0) { site = site.Substring(0, cut); }
+            if (site == "") { continue; }
+            McpServer.Bump(map, site);
+        }
+    }
+
+    /// The definition of a symbol as source text: resolve it in the symbol
+    /// index, then return that window of the file. One call instead of
+    /// lookup-then-read, and it never returns a whole file.
+    static string ReadContext(string name, int before, int lines) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string lower = name.ToLower();
+        string dotted = "." + lower;
+        List<string> idx = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> cands = new List<JsonValue>();
+        for (int i = 0; i < idx.Count; i = i + 1) {
+            if (cands.Count >= McpServer.CandCap()) { break; }
+            string full = McpServer.NameField(idx[i]);
+            if (full == "") { continue; }
+            bool exact = full == lower;
+            bool member = full.Length > dotted.Length
+                && full.Substring(full.Length - dotted.Length,
+                                  dotted.Length) == dotted;
+            if (!exact && !member) { continue; }
+            JsonValue rec = McpServer.IndexRecord(idx[i]);
+            if (rec != null) { cands.Add(rec); }
+        }
+        JsonValue best = McpServer.RankedTake(cands, 1);
+        if (best.Count() == 0) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("hint", JsonValue.NewStr(
+                "no definition indexed for that name; try zan_api_search"));
+            return miss.ToJson();
+        }
+        JsonValue def = best.At(0);
+        string rel = def.Str("file", "");
+        int line = def.Int("line", 0);
+        string full2 = McpServer.Resolve(rel);
+        if (rel == "" || full2 == "" || !File.Exists(full2)) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("definition", def);
+            miss.Put("hint", JsonValue.NewStr(
+                "the definition lives outside this workspace ('" + rel
+                + "'); the index record above is all this server can show"));
+            return miss.ToJson();
+        }
+        int from = line - before;
+        if (from < 1) { from = 1; }
+        JsonValue args = JsonValue.NewObject();
+        args.Put("from_line", JsonValue.NewNum(Convert.ToString(from)));
+        args.Put("max_lines", JsonValue.NewNum(Convert.ToString(lines)));
+        JsonValue win = McpServer.ParseBody(
+            McpServer.ReadLinesDoc(rel, full2, args));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        o.Put("definition", def);
+        if (win != null) {
+            o.Put("from_line", win.Get("from_line"));
+            o.Put("to_line", win.Get("to_line"));
+            o.Put("fileLines", win.Get("lines"));
+            o.Put("content", win.Get("content"));
+        }
+        return o.ToJson();
+    }
+
+    /// Rebuild .zanmap/{routes,entities,index}.json: export the workspace's
+    /// unit metadata with zanc --gen-meta, then run the same GenIndex the
+    /// compiler runs, so the index cannot drift from the generated code.
+    static async string RefreshIndex() {
+        List<string> srcs = new List<string>();
+        string scope = "src";
+        if (!Directory.Exists(McpServer.root + "/src")) { scope = ""; }
+        McpServer.Walk(scope, McpServer.Resolve(scope), "*.zan", "",
+                       20000, srcs, 0);
+        JsonValue o = JsonValue.NewObject();
+        if (srcs.Count == 0) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(
+                "no .zan sources found under " + McpServer.root));
+            return o.ToJson();
+        }
+        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
+        // A response file (@list): 200+ paths do not fit a command line on
+        // Windows, and zanc expands @file itself.
+        string listPath = McpServer.root + "/_scratch/mcp_index_sources.txt";
+        StringBuilder list = new StringBuilder();
+        for (int i = 0; i < srcs.Count; i = i + 1) {
+            list.Append(McpServer.root + "/" + srcs[i]);
+            list.Append("\n");
+        }
+        File.WriteAllText(listPath, list.ToString());
+        string metaPath = McpServer.root + "/_scratch/mcp_index_meta.json";
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"@" + listPath
+            + "\" --stdlib-path \"" + McpServer.stdlibPath
+            + "\" --gen-meta \"" + metaPath + "\"");
+        if (!File.Exists(metaPath)) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(
+                "zanc --gen-meta produced no metadata"));
+            o.Put("compiler", McpServer.ParseBody(McpServer.DiagResult(res)));
+            return o.ToJson();
+        }
+        JsonValue unit = McpServer.ParseBody(File.ReadAllText(metaPath));
+        if (unit == null) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr("metadata is not valid JSON"));
+            return o.ToJson();
+        }
+        // 元数据用绝对路径喂的编译器,索引对外只给工作区相对路径。
+        GenIndex.Base = McpServer.root;
+        int routes = GenIndex.WriteTo(unit, McpServer.root + "/.zanmap");
+        JsonValue man = McpServer.ParseBody(
+            File.ReadAllText(McpServer.indexManifestPath));
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("sources", JsonValue.NewNum(Convert.ToString(srcs.Count)));
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes)));
+        if (man != null) { o.Put("entities", man.Get("entities")); }
+        JsonValue arte = JsonValue.NewArray();
+        arte.Append(JsonValue.NewStr(".zanmap/routes.json"));
+        arte.Append(JsonValue.NewStr(".zanmap/entities.json"));
+        arte.Append(JsonValue.NewStr(".zanmap/index.json"));
+        o.Put("artefacts", arte);
+        o.Put("note", JsonValue.NewStr(
+            "symbols.json/refs.json/repo.map.txt come from"
+            + " tools/repomap/RepoMap.zan and are not touched here"));
+        return o.ToJson();
+    }
+
+    static string Example(string topic) {
+        if (!File.Exists(McpServer.galleryPath)) {
+            return "error: gallery.json not found at " + McpServer.galleryPath;
+        }
+        JsonValue man = McpServer.ParseBody(File.ReadAllText(McpServer.galleryPath));
+        if (man == null) { return "error: gallery.json is not valid JSON"; }
+        JsonValue entries = man.Get("entries");
+        if (entries == null) { return "error: gallery.json has no 'entries'"; }
+        if (topic == "") {
+            JsonValue list = JsonValue.NewArray();
+            for (int i = 0; i < entries.Count(); i = i + 1) {
+                JsonValue e = entries.At(i);
+                JsonValue row = JsonValue.NewObject();
+                row.Put("topic", JsonValue.NewStr(e.Str("topic", "")));
+                row.Put("kind", JsonValue.NewStr(e.Str("kind", "")));
+                row.Put("summary", JsonValue.NewStr(e.Str("summary", "")));
+                list.Append(row);
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("topics", list);
+            o.Put("usage", JsonValue.NewStr(
+                "call zan_example with one of these 'topic' values to get the files"));
+            return o.ToJson();
+        }
+        JsonValue match = McpServer.MatchEntry(entries, topic);
+        if (match == null) {
+            return "error: no example for topic '" + topic
+                + "'; call zan_example with no topic to list the catalog";
+        }
+        string kind = match.Str("kind", "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("topic", JsonValue.NewStr(match.Str("topic", "")));
+        o.Put("kind", JsonValue.NewStr(kind));
+        o.Put("summary", JsonValue.NewStr(match.Str("summary", "")));
+        o.Put("build", JsonValue.NewStr(match.Str("build", "")));
+        JsonValue models = man.Get("models");
+        if (models != null && models.Has(kind)) { o.Put("model", models.Get(kind)); }
+        JsonValue files = match.Get("files");
+        JsonValue outFiles = JsonValue.NewArray();
+        if (files != null) {
+            for (int i = 0; i < files.Count(); i = i + 1) {
+                string rel = files.At(i).AsString("");
+                JsonValue fo = JsonValue.NewObject();
+                fo.Put("path", JsonValue.NewStr(rel));
+                string full = McpServer.TrimTrailingSep(Environment.ExeDir())
+                    + "/" + rel;
+                if (!File.Exists(full)) { full = McpServer.root + "/" + rel; }
+                if (File.Exists(full)) {
+                    fo.Put("content", JsonValue.NewStr(File.ReadAllText(full)));
+                } else {
+                    fo.Put("error", JsonValue.NewStr("file missing on server"));
+                }
+                outFiles.Append(fo);
+            }
+        }
+        o.Put("files", outFiles);
+        return o.ToJson();
+    }
+
+    static string FormSchema(string control) {
+        if (!File.Exists(McpServer.formSchemaPath)) {
+            return "error: zform.json not found at " + McpServer.formSchemaPath;
+        }
+        JsonValue schema = McpServer.ParseBody(
+            File.ReadAllText(McpServer.formSchemaPath));
+        if (schema == null) { return "error: zform.json is not valid JSON"; }
+        JsonValue controls = schema.Get("controls");
+        if (controls == null || !controls.IsArray()) {
+            return "error: zform.json has no 'controls'";
+        }
+        JsonValue out0 = JsonValue.NewObject();
+        if (control == "") {
+            out0.Put("document", schema.Get("document"));
+            out0.Put("fields", schema.Get("fields"));
+            out0.Put("commonEvents", schema.Get("commonEvents"));
+            JsonValue names = JsonValue.NewArray();
+            for (int i = 0; i < controls.Count(); i = i + 1) {
+                names.Append(JsonValue.NewStr(controls.At(i).Str("name", "")));
+            }
+            out0.Put("controls", names);
+            return out0.ToJson();
+        }
+        JsonValue match = null;
+        for (int i = 0; i < controls.Count(); i = i + 1) {
+            if (controls.At(i).Str("name", "") == control) {
+                match = controls.At(i);
+                break;
+            }
+        }
+        if (match == null) {
+            for (int i = 0; i < controls.Count(); i = i + 1) {
+                if (McpServer.Find(controls.At(i).Str("name", ""), control) >= 0) {
+                    match = controls.At(i);
+                    break;
+                }
+            }
+        }
+        if (match == null) {
+            return "error: no form control matching '" + control + "'";
+        }
+        out0.Put("control", match);
+        return out0.ToJson();
+    }
+
+    static JsonValue MatchEntry(JsonValue entries, string topic) {
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            if (entries.At(i).Str("topic", "") == topic) { return entries.At(i); }
+        }
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            if (McpServer.Find(entries.At(i).Str("topic", ""), topic) >= 0) {
+                return entries.At(i);
+            }
+        }
+        return null;
+    }
+
+    static async string Compile(string filename, string content) {
+        if (filename == "") { filename = "snippet.zan"; }
+        if (!McpServer.IsBareName(filename)) {
+            return "error: filename must be a bare file name with no path separators";
+        }
+        McpServer.compileSeq = McpServer.compileSeq + 1;
+        string dir = McpServer.workRoot + "/" + Convert.ToString(McpServer.compileSeq);
+        Directory.CreateDirectoryRecursive(dir);
+        File.WriteAllText(dir + "/" + filename, content);
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"" + dir + "/" + filename
+            + "\" --stdlib-path \"" + McpServer.stdlibPath + "\" -o \""
+            + dir + "/out" + McpServer.ExeSuffix() + "\"");
+        return McpServer.DiagResult(res);
+    }
+
+    static async string BuildProject(string entry) {
+        if (entry == "") {
+            if (File.Exists(McpServer.root + "/src/App.zan")) { entry = "src/App.zan"; }
+            else { entry = "src/main.zan"; }
+        }
+        string full = McpServer.Resolve(entry);
+        if (full == "") { return McpServer.OutsideMsg(entry); }
+        if (!File.Exists(full)) { return "error: entry not found: " + entry; }
+        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
+        string outPath = McpServer.root + "/_scratch/mcp_project_out"
+            + McpServer.ExeSuffix();
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"" + full
+            + "\" --stdlib-path \"" + McpServer.stdlibPath + "\" -o \""
+            + outPath + "\"");
+        return McpServer.DiagResult(res);
+    }
+
+    /// Turns compiler output into {ok, exitCode, diagnostics[], raw}. `ok` is
+    /// the process exit code, not a guess based on the text.
+    static string DiagResult(ProcessResult res) {
+        JsonValue diags = JsonValue.NewArray();
+        StringBuilder rawSb = new StringBuilder();
+        for (int i = 0; i < res.lines.Count; i = i + 1) {
+            string line = McpServer.StripAnsi(res.lines[i]);
+            rawSb.Append(line);
+            rawSb.Append("\n");
+            string sev = "";
+            int pos = McpServer.Find(line, " error:");
+            if (pos >= 0) { sev = "error"; }
+            if (sev == "") {
+                pos = McpServer.Find(line, " warning:");
+                if (pos >= 0) { sev = "warning"; }
+            }
+            if (sev == "") {
+                pos = McpServer.Find(line, " note:");
+                if (pos >= 0) { sev = "note"; }
+            }
+            if (sev == "") { continue; }
+            string loc = line.Substring(0, pos);
+            if (loc.Length > 0 && loc.Substring(loc.Length - 1, 1) == ":") {
+                loc = loc.Substring(0, loc.Length - 1);
+            }
+            int markerLen = sev.Length + 2;
+            string msg = line.Substring(pos + markerLen, line.Length - pos - markerLen);
+            JsonValue d = JsonValue.NewObject();
+            d.Put("severity", JsonValue.NewStr(sev));
+            d.Put("location", JsonValue.NewStr(loc));
+            McpServer.PeelLineCol(loc, d);
+            d.Put("message", JsonValue.NewStr(McpServer.Trim(msg)));
+            diags.Append(d);
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(res.exitCode == 0));
+        o.Put("exitCode", JsonValue.NewNum(Convert.ToString(res.exitCode)));
+        o.Put("diagnostics", diags);
+        o.Put("raw", JsonValue.NewStr(rawSb.ToString()));
+        return o.ToJson();
+    }
+
+    static void PeelLineCol(string loc, JsonValue d) {
+        int c2 = McpServer.LastColon(loc);
+        if (c2 < 0) { return; }
+        string colStr = loc.Substring(c2 + 1, loc.Length - c2 - 1);
+        string head = loc.Substring(0, c2);
+        int c1 = McpServer.LastColon(head);
+        if (c1 < 0) { return; }
+        string lineStr = head.Substring(c1 + 1, head.Length - c1 - 1);
+        if (McpServer.AllDigits(colStr) && McpServer.AllDigits(lineStr)) {
+            d.Put("file", JsonValue.NewStr(head.Substring(0, c1)));
+            d.Put("line", JsonValue.NewNum(lineStr));
+            d.Put("col", JsonValue.NewNum(colStr));
+        }
+    }
+
+    static int LastColon(string s) {
+        for (int i = s.Length - 1; i >= 0; i = i - 1) {
+            if ((s[i] & 255) == 58) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static bool IsBareName(string s) {
+        if (s == "") { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 47 || c == 92) { return false; }
+        }
+        for (int i = 0; i + 1 < s.Length; i = i + 1) {
+            if (s.Substring(i, 2) == "..") { return false; }
+        }
+        return true;
+    }
+
+    // ---- tool catalog -------------------------------------------------------
+
+    static JsonValue ToolsDoc() {
+        JsonValue arr = JsonValue.NewArray();
+
+        // First in the catalog on purpose: it is the one call that makes the
+        // rest of the catalog self-explanatory.
+        JsonValue t = McpServer.NewTool("zan_start_here",
+            "START HERE. Everything you need to work in this project in one"
+            + " call: layout and entry point, build/run/test commands, the Zan"
+            + " coding rules, the tool catalog with what to use each tool for,"
+            + " and the available resources. Costs one round trip and replaces"
+            + " browsing the tree.");
+        arr.Append(t);
+
+        t = McpServer.NewTool("health_check",
+            "Liveness and configuration of this server: workspace root,"
+            + " read-only/exec flags, protocol version, platform.");
+        arr.Append(t);
+
+        t = McpServer.NewTool("list_dir",
+            "List one directory of the workspace. Returns"
+            + " {type,path,count,entries:[{name,type,size}]}.");
+        McpServer.AddParam(t, "path", "string",
+            "Workspace-relative directory ('' or '.' for the root).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("read_file",
+            "Read a workspace file -- ideally ONE window of it. Pass"
+            + " from_line/max_lines (numbered output) to read just the"
+            + " neighbourhood of a search_text hit; that is the cheap read and"
+            + " it gives you the line numbers to cite and to edit by. Reading"
+            + " the whole file, or the same lines twice, buys nothing: what a"
+            + " tool result already told you in this conversation is still"
+            + " true unless you changed it. Text comes back in 'content',"
+            + " binary (or encoding='base64') in 'content_base64'.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "from_line", "integer",
+            "First line (1-based). Preferred over offset for source code.", false);
+        McpServer.AddParam(t, "max_lines", "integer",
+            "Lines to return (default 120).", false);
+        McpServer.AddParam(t, "numbered", "boolean",
+            "Prefix each line with its number (default true).", false);
+        McpServer.AddParam(t, "offset", "integer", "First byte to read.", false);
+        McpServer.AddParam(t, "limit", "integer", "Maximum bytes to read.", false);
+        McpServer.AddParam(t, "encoding", "string",
+            "'text' (default when the bytes are valid UTF-8) or 'base64'.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("write_file",
+            "Create or overwrite a workspace file, byte for byte. Parent"
+            + " directories are created. Pass content_base64 for binary data"
+            + " and append=true to add to the end.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "content", "string", "UTF-8 text to write.", false);
+        McpServer.AddParam(t, "content_base64", "string", "Base64 bytes to write.", false);
+        McpServer.AddParam(t, "append", "boolean", "Append instead of replacing.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("edit_file",
+            "Change a file in place by replacing an exact snippet. This is the"
+            + " normal way to edit: you send only the lines that change, so"
+            + " there is no reason to read the whole file first. 'old' must"
+            + " match byte for byte (whitespace included) and must be unique"
+            + " unless all=true; an ambiguous match is refused, not guessed."
+            + " Make the whole change in one call rather than one line per"
+            + " call. Returns {ok,path,replacements,line}.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "old", "string",
+            "Exact text to replace, with enough context to be unique.", true);
+        McpServer.AddParam(t, "new", "string",
+            "Replacement text ('' deletes).", true);
+        McpServer.AddParam(t, "all", "boolean",
+            "Replace every occurrence instead of requiring uniqueness.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("skills_list",
+            "Catalogue of the skills available here: name, one-line summary,"
+            + " size. Bodies are NOT included -- call skill_read only for the"
+            + " one that matches the task (progressive disclosure keeps the"
+            + " prompt small and cacheable).");
+        arr.Append(t);
+
+        t = McpServer.NewTool("skill_read",
+            "Read one skill's instructions (SKILL.md by default, or another"
+            + " file inside that skill's directory).");
+        McpServer.AddParam(t, "name", "string", "Skill name from skills_list.", true);
+        McpServer.AddParam(t, "file", "string",
+            "File inside the skill directory (default SKILL.md).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("mkdir", "Create a directory (recursively).");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative directory.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("delete_path",
+            "Delete a file, or a directory when recursive=true.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative path.", true);
+        McpServer.AddParam(t, "recursive", "boolean", "Allow deleting a tree.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("move_path", "Move or rename a file.");
+        McpServer.AddParam(t, "from", "string", "Source path.", true);
+        McpServer.AddParam(t, "to", "string", "Destination path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("copy_path", "Copy a file.");
+        McpServer.AddParam(t, "from", "string", "Source path.", true);
+        McpServer.AddParam(t, "to", "string", "Destination path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("stat_path",
+            "Existence, type, size and modification time of one path.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("find_files",
+            "Find files by name under a directory. 'glob' supports * and ?;"
+            + " 'contains' is a case-insensitive substring of the name."
+            + " .git/node_modules/build/dist are skipped.");
+        McpServer.AddParam(t, "path", "string", "Directory to walk ('' = root).", false);
+        McpServer.AddParam(t, "glob", "string", "Name pattern, e.g. '*.zan'.", false);
+        McpServer.AddParam(t, "contains", "string", "Substring of the name.", false);
+        McpServer.AddParam(t, "max_results", "integer", "Result cap (default 500).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("search_text",
+            "Grep the workspace: literal substring search over text files,"
+            + " returning {file,line,text} matches.");
+        McpServer.AddParam(t, "query", "string", "Text to search for.", true);
+        McpServer.AddParam(t, "path", "string", "Directory to search ('' = root).", false);
+        McpServer.AddParam(t, "glob", "string", "Restrict to names matching this.", false);
+        McpServer.AddParam(t, "ignore_case", "boolean", "Default true.", false);
+        McpServer.AddParam(t, "max_results", "integer", "Result cap (default 200).", false);
+        arr.Append(t);
+
+        if (McpServer.CanExec() || McpServer.frozenTools) {
+            t = McpServer.NewTool("run_command",
+                "Run a shell command in the workspace and return"
+                + " {ok,exitCode,stdout} with stdout and stderr merged.");
+            McpServer.AddParam(t, "command", "string", "Command line to run.", true);
+            McpServer.AddParam(t, "shell", "string",
+                "'cmd' or 'powershell' on Windows; 'sh'/'bash' elsewhere.", false);
+            McpServer.AddParam(t, "cwd", "string",
+                "Workspace-relative working directory.", false);
+            arr.Append(t);
+        }
+
+        // Zan-specific tools appear only when this server actually has the
+        // toolchain/knowledge to back them, so a generic client is not offered
+        // tools that would always fail.
+        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_api_search",
+                "Search the Zan stdlib symbol index (name/kind/file/line/signature)."
+                + " Use it before writing Zan code instead of guessing signatures.");
+            McpServer.AddParam(t, "query", "string", "Symbol fragment(s).", true);
+            McpServer.AddParam(t, "limit", "integer", "Result cap (default 40).", false);
+            arr.Append(t);
+
+            t = McpServer.NewTool("zan_lookup_symbol",
+                "Locate a definition exactly: pass \"File\" or \"File.ReadAllText\""
+                + " (or a bare member name) and get kind, signature, summary and"
+                + " file:line back. Use this instead of reading a file to find"
+                + " out what something is.");
+            McpServer.AddParam(t, "name", "string",
+                "Type, Type.Member, or member name.", true);
+            McpServer.AddParam(t, "limit", "integer", "Result cap (default 10).", false);
+            arr.Append(t);
+
+            t = McpServer.NewTool("zan_list_members",
+                "List every member of one type with signatures and file:line --"
+                + " the per-type API page. Cheaper than fetching a whole"
+                + " namespace reference page.");
+            McpServer.AddParam(t, "type", "string", "Type name.", true);
+            McpServer.AddParam(t, "filter", "string",
+                "Only members whose name contains this fragment.", false);
+            McpServer.AddParam(t, "limit", "integer", "Result cap (default 80).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_find_refs",
+                "Impact of a change: declarations, the lines that mention the"
+                + " name, how many of them are tests, and the types that"
+                + " inherit it. Reference sites are text-level identifier"
+                + " matches (not overload-resolved), so review them as"
+                + " candidates; 'subtypes' comes from declared bases and is"
+                + " exact.");
+            McpServer.AddParam(t, "name", "string",
+                "Simple name (\"ReadAllText\") or Type.Member.", true);
+            McpServer.AddParam(t, "limit", "integer",
+                "Reference sites to return (default 30).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.indexManifestPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_project_overview",
+                "Read this before touching a project you do not know: size,"
+                + " routes grouped by module and by verb, entity -> table"
+                + " map, and the actions that are authorized but carry no"
+                + " Perm. One .zanmap read instead of walking the tree.");
+            McpServer.AddParam(t, "limit", "integer",
+                "Cap for the sample lists (default 40).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.routesIndexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_route_lookup",
+                "Answer \"which action serves this URL, and what may call"
+                + " it\" without opening a controller: verb, path, action"
+                + " name, controller, module, title, auth gate, Perm bits,"
+                + " bound parameters and file:line. Derived from the"
+                + " compiler's route generation, so it is what the app"
+                + " registers at startup.");
+            McpServer.AddParam(t, "query", "string",
+                "Fragment of the URL, action, controller, module or title.",
+                false);
+            McpServer.AddParam(t, "method", "string",
+                "Restrict to one HTTP verb.", false);
+            McpServer.AddParam(t, "unmarked_perm", "boolean",
+                "Only actions with no Perm attribute (RBAC audit).", false);
+            McpServer.AddParam(t, "limit", "integer",
+                "Result cap (default 40).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.entitiesIndexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_orm_lookup",
+                "Entity -> table -> columns without reading the model: column"
+                + " names, types, primary key/identity, nullability, string"
+                + " length, navigations, indexes, and the generated facades"
+                + " to write against (__DbQ_/__DbI_/__DbU_/__DbD_/Cols)."
+                + " Call with no argument for the entity->table map.");
+            McpServer.AddParam(t, "query", "string",
+                "Entity name, table name or namespace fragment.", false);
+            McpServer.AddParam(t, "column", "string",
+                "Find the entities that carry this column/field.", false);
+            McpServer.AddParam(t, "limit", "integer",
+                "Result cap (default 10).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_change_impact",
+                "Before editing a shared symbol: where it is declared, which"
+                + " files mention it, how much of that is tests, and -- what"
+                + " a grep cannot tell you -- the routes and entities those"
+                + " files own, so you see the URLs and tables at risk."
+                + " Reference sites are text-level candidates; the route and"
+                + " entity attribution is exact.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name (\"OpenRouterKey\") or Type.Member.", true);
+            McpServer.AddParam(t, "limit", "integer",
+                "Route rows to return (default 30).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_read_context",
+                "The source of ONE definition: resolves the symbol in the"
+                + " index and returns that window of the file, numbered."
+                + " Use it instead of read_file when you know the name but"
+                + " not the file, and instead of reading a whole file to see"
+                + " one method.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name or Type.Member.", true);
+            McpServer.AddParam(t, "before", "integer",
+                "Lines of context above the declaration (default 4).", false);
+            McpServer.AddParam(t, "lines", "integer",
+                "Lines to return (default 80).", false);
+            arr.Append(t);
+        }
+        if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_refresh_index",
+                "Rebuild the project semantic index (.zanmap/routes.json,"
+                + " entities.json, index.json) from the workspace sources via"
+                + " zanc --gen-meta. Run it after adding or re-attributing a"
+                + " controller or an entity. Leaves symbols.json / refs.json"
+                + " (RepoMap) alone.");
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.galleryPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_example",
+                "Return a shipped, build-verified Zan template for a topic."
+                + " Call with no topic to list the catalog.");
+            McpServer.AddParam(t, "topic", "string", "Catalog topic.", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.formSchemaPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_form_schema",
+                "Return the .zform document schema and the generated control"
+                + " catalog. Call without control for names, or pass a control"
+                + " class name (substring matching is supported) for its full"
+                + " Props()/Events() entry.");
+            McpServer.AddParam(t, "control", "string",
+                "Control class name or fragment.", false);
+            arr.Append(t);
+        }
+        if ((McpServer.Mutable() && McpServer.KnowledgeInputs())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_refresh_knowledge",
+                "Regenerate gallery.json and zform.json in the server's"
+                + " knowledge directory from the workspace sources. Does"
+                + " not build RepoMap or replace symbols.json.");
+            arr.Append(t);
+        }
+        if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_compile",
+                "Compile one Zan snippet in an isolated directory; returns"
+                + " {ok,exitCode,diagnostics[],raw}.");
+            McpServer.AddParam(t, "filename", "string", "Bare file name.", false);
+            McpServer.AddParam(t, "content", "string", "Source text.", true);
+            arr.Append(t);
+
+            t = McpServer.NewTool("zan_build_project",
+                "Compile the workspace project (default entry src/App.zan or"
+                + " src/main.zan); returns {ok,exitCode,diagnostics[],raw}.");
+            McpServer.AddParam(t, "entry", "string", "Entry source file.", false);
+            arr.Append(t);
+        }
+        return arr;
+    }
+
+    // ---- orientation ---------------------------------------------------------
+
+    /// The zero-discovery briefing: what this project is, how to build, test
+    /// and debug it, which rules to follow and which tool answers which
+    /// question. Everything here is observed from the workspace and the
+    /// installation next to this server, never assumed.
+    static JsonValue StartHere() {
+        McpServer.KnowledgeCheck(true);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("workspace", JsonValue.NewStr(McpServer.root));
+        o.Put("platform", JsonValue.NewStr(McpServer.Platform()));
+        o.Put("language", JsonValue.NewStr(
+            "Zan - statically typed, C#-like syntax, ARC memory management,"
+            + " compiled to a native executable by zanc."));
+
+        // ---- project shape --------------------------------------------------
+        JsonValue proj = JsonValue.NewObject();
+        string entry = McpServer.DetectEntry();
+        proj.Put("entry", JsonValue.NewStr(entry));
+        proj.Put("kind", JsonValue.NewStr(McpServer.DetectKind()));
+        JsonValue dirs = JsonValue.NewArray();
+        McpServer.AddIfDir(dirs, "src", "Zan sources");
+        McpServer.AddIfDir(dirs, "src/Controller", "MVC controllers: attribute-driven routes");
+        McpServer.AddIfDir(dirs, "src/Model", "ORM models");
+        McpServer.AddIfDir(dirs, "src/Dao", "data access");
+        McpServer.AddIfDir(dirs, "src/Feature", "feature services");
+        McpServer.AddIfDir(dirs, "src/Framework", "app framework wiring");
+        McpServer.AddIfDir(dirs, "views", "server-rendered templates");
+        McpServer.AddIfDir(dirs, "wwwroot", "static assets");
+        McpServer.AddIfDir(dirs, "config", "external runtime configuration (app.json)");
+        McpServer.AddIfDir(dirs, "stdlib", "Zan standard library sources");
+        McpServer.AddIfDir(dirs, "templates", "project templates");
+        McpServer.AddIfDir(dirs, "examples", "runnable example programs");
+        McpServer.AddIfDir(dirs, "tests", "test suite");
+        McpServer.AddIfDir(dirs, "docs", "documentation");
+        proj.Put("directories", dirs);
+        JsonValue cfg = JsonValue.NewArray();
+        McpServer.AddIfFile(cfg, "config/app.json",
+            "runtime configuration, read at startup and NOT compiled in:"
+            + " change behaviour here before changing code");
+        McpServer.AddIfFile(cfg, "AGENTS.md", "rules for agents working in this project");
+        McpServer.AddIfFile(cfg, "README.md", "project overview");
+        proj.Put("keyFiles", cfg);
+        o.Put("project", proj);
+
+        // ---- commands -------------------------------------------------------
+        JsonValue cmd = JsonValue.NewObject();
+        cmd.Put("compiler", JsonValue.NewStr(McpServer.zancPath));
+        cmd.Put("stdlib", JsonValue.NewStr(McpServer.stdlibPath));
+        if (entry != "") {
+            cmd.Put("build", JsonValue.NewStr("\"" + McpServer.zancPath + "\" "
+                + entry + " --auto-stdlib -o build/app" + McpServer.ExeSuffix()));
+            cmd.Put("buildTool", JsonValue.NewStr(
+                "zan_build_project - compiles the project and returns"
+                + " structured diagnostics; prefer it over run_command"));
+        }
+        cmd.Put("checkSnippet", JsonValue.NewStr(
+            "zan_compile - compiles one snippet in an isolated directory;"
+            + " use it to verify an API call before editing a real file"));
+        McpServer.AddIfFile2(cmd, "test", "scripts/test.ps1",
+            "powershell -File scripts/test.ps1 smoke");
+        McpServer.AddIfFile2(cmd, "languageServer",
+            "toolchain/zan-lsp" + McpServer.ExeSuffix(),
+            "toolchain/zan-lsp" + McpServer.ExeSuffix()
+            + " - LSP over stdio with Content-Length framing (completion,"
+            + " hover, definition, references, rename, diagnostics)");
+        McpServer.AddIfFile2(cmd, "debugAdapter",
+            "toolchain/zan-dap" + McpServer.ExeSuffix(),
+            "toolchain/zan-dap" + McpServer.ExeSuffix()
+            + " - Debug Adapter Protocol over stdio (breakpoints, stepping,"
+            + " variables, evaluate)");
+        o.Put("commands", cmd);
+
+        // ---- rules ----------------------------------------------------------
+        JsonValue rules = JsonValue.NewArray();
+        rules.Append(JsonValue.NewStr(
+            "Never guess an API. Call zan_api_search for the signature and"
+            + " zan_example for a working pattern before you write code."));
+        rules.Append(JsonValue.NewStr(
+            "Compile before you claim anything works: zan_compile for a"
+            + " snippet, zan_build_project for the project. Read the"
+            + " diagnostics array, which carries file, line, column and code."));
+        rules.Append(JsonValue.NewStr(
+            "Read once, precisely, then edit. search_text for the line,"
+            + " read_file(path, from_line, max_lines) for that window,"
+            + " edit_file for the whole change in one call. Do not re-read a"
+            + " range you already have and do not read a file just to be able"
+            + " to write it back: a tool result stays true until you change"
+            + " it."));
+        rules.Append(JsonValue.NewStr(
+            "Reuse what exists. Prefer an existing class, service or template"
+            + " over a new interface with the same job."));
+        rules.Append(JsonValue.NewStr(
+            "Configuration lives in config/app.json (or the project's own"
+            + " config file) and is read at run time; do not hard-code hosts,"
+            + " ports, credentials or business limits into sources."));
+        rules.Append(JsonValue.NewStr(
+            "GUI code uses the standard library's Gui components. Do not"
+            + " hand-draw widgets."));
+        rules.Append(JsonValue.NewStr(
+            "Keep throwaway files out of the project: probes and scratch"
+            + " builds belong in _scratch/."));
+        rules.Append(JsonValue.NewStr(
+            "Say what you verified and what you did not. Do not report a"
+            + " build or a test as passing unless you ran it."));
+        o.Put("rules", rules);
+
+        // ---- how to use the tools -------------------------------------------
+        JsonValue how = JsonValue.NewArray();
+        how.Append(JsonValue.NewStr(
+            "zan_api_search(query) - stdlib symbol index: name, kind, file,"
+            + " line, signature. First stop for 'how do I call X'."));
+        how.Append(JsonValue.NewStr(
+            "zan_example(topic) - shipped, build-verified programs; call with"
+            + " no topic to list the catalog."));
+        how.Append(JsonValue.NewStr(
+            "search_text / find_files - locate code in this workspace."));
+        how.Append(JsonValue.NewStr(
+            "read_file(path, from_line, max_lines) - one numbered window, not"
+            + " the whole file; offset/limit for bytes and binaries."));
+        how.Append(JsonValue.NewStr(
+            "edit_file(path, old, new) - replace an exact snippet in place;"
+            + " the default way to change code."));
+        how.Append(JsonValue.NewStr(
+            "write_file(path, content) - create a file or replace it whole."));
+        how.Append(JsonValue.NewStr(
+            "skills_list() then skill_read(name) - the project's own"
+            + " procedures; read a body only when its summary fits the task."));
+        how.Append(JsonValue.NewStr(
+            "zan_build_project(entry) / zan_compile(content) - compile and get"
+            + " {ok, exitCode, diagnostics[], raw}."));
+        how.Append(JsonValue.NewStr(
+            "run_command(command) - anything else (tests, git, generators)."));
+        o.Put("toolGuide", how);
+
+        JsonValue avail = JsonValue.NewArray();
+        JsonValue cat = McpServer.ToolsDoc();
+        for (int i = 0; i < cat.Count(); i = i + 1) {
+            avail.Append(JsonValue.NewStr(cat.At(i).Str("name", "")));
+        }
+        o.Put("tools", avail);
+        JsonValue res = McpServer.ResourcesDoc();
+        o.Put("resources", res);
+        if (res.Count() == 0) {
+            // Empty is the normal state for a fresh project; say how to fill it
+            // instead of letting the client conclude the feature is missing.
+            o.Put("resourcesHint", JsonValue.NewStr(
+                "No repo:// resources yet: they are the .zanmap/ artefacts of"
+                + " tools/repomap (repo.map.txt, symbols.json, routes.json)."
+                + " Generate them with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o build/repomap" + McpServer.ExeSuffix()
+                + " && build/repomap" + McpServer.ExeSuffix() + " ."));
+        }
+
+        // ---- what is actually wired up here ---------------------------------
+        JsonValue st = JsonValue.NewObject();
+        st.Put("apiIndex", JsonValue.NewBool(File.Exists(McpServer.indexPath)));
+        st.Put("exampleCatalog", JsonValue.NewBool(File.Exists(McpServer.galleryPath)));
+        st.Put("formSchema", JsonValue.NewBool(File.Exists(McpServer.formSchemaPath)));
+        st.Put("knowledgeFresh", JsonValue.NewBool(McpServer.knowledgeFresh));
+        st.Put("knowledgeStatus", JsonValue.NewStr(McpServer.knowledgeStatus));
+        st.Put("knowledgeRefresh",
+            JsonValue.NewBool(McpServer.Mutable() && McpServer.KnowledgeInputs()));
+        st.Put("compiler", JsonValue.NewBool(McpServer.ZanToolsAvailable()));
+        st.Put("exec", JsonValue.NewBool(McpServer.CanExec()));
+        st.Put("writable", JsonValue.NewBool(McpServer.Mutable()));
+        o.Put("available", st);
+
+        JsonValue next = JsonValue.NewArray();
+        next.Append(JsonValue.NewStr(
+            "1. read the project entry and the file you must change"
+            + " (read_file), or search for it (search_text)"));
+        next.Append(JsonValue.NewStr(
+            "2. look up every API you are about to use (zan_api_search,"
+            + " zan_example)"));
+        next.Append(JsonValue.NewStr("3. edit (edit_file, one call per change)"));
+        next.Append(JsonValue.NewStr(
+            "4. compile (zan_build_project) and fix the diagnostics"));
+        next.Append(JsonValue.NewStr(
+            "5. run the tests or the program (run_command)"));
+        o.Put("workflow", next);
+        return o;
+    }
+
+    /// The project's entry source, as a workspace-relative path ("" when this
+    /// workspace has none).
+    static string DetectEntry() {
+        if (File.Exists(McpServer.root + "/src/main.zan")) { return "src/main.zan"; }
+        if (File.Exists(McpServer.root + "/src/App.zan")) { return "src/App.zan"; }
+        if (File.Exists(McpServer.root + "/main.zan")) { return "main.zan"; }
+        return "";
+    }
+
+    static string DetectKind() {
+        if (Directory.Exists(McpServer.root + "/src/Controller")) {
+            return "server-mvc: routes and permissions come from attributes"
+                + " evaluated at compile time -- [Route(\"api/[controller]/"
+                + "[action]\")] on the class, [HttpGet]/[HttpPost]/[HttpPut]/"
+                + "[HttpDelete] on the action, [Custom(Authorization ="
+                + " CustomAuthorization.None|Auth|Login|Grant|ApiAuth)] for the"
+                + " auth gate (method overrides class), [Description] for the"
+                + " label; ORM models, config/app.json read at run time,"
+                + " API docs at /api/docs";
+        }
+        if (Directory.Exists(McpServer.root + "/views")) { return "server"; }
+        if (McpServer.DetectEntry() == "") { return "unknown"; }
+        return "program";
+    }
+
+    static void AddIfDir(JsonValue arr, string rel, string desc) {
+        if (!Directory.Exists(McpServer.root + "/" + rel)) { return; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("contains", JsonValue.NewStr(desc));
+        arr.Append(o);
+    }
+
+    static void AddIfFile(JsonValue arr, string rel, string desc) {
+        if (!File.Exists(McpServer.root + "/" + rel)) { return; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("purpose", JsonValue.NewStr(desc));
+        arr.Append(o);
+    }
+
+    /// Records `key` only when the file backing it exists, so the briefing
+    /// never advertises a command that cannot run. Relative paths are tried
+    /// against the workspace first, then next to this server (the published
+    /// layout, where the toolchain sits beside the exe).
+    static void AddIfFile2(JsonValue o, string key, string rel, string value) {
+        if (File.Exists(McpServer.root + "/" + rel)) {
+            o.Put(key, JsonValue.NewStr(value));
+            return;
+        }
+        string exeDir = McpServer.TrimTrailingSep(Environment.ExeDir());
+        if (File.Exists(exeDir + "/" + rel)) {
+            o.Put(key, JsonValue.NewStr(exeDir + "/" + rel));
+        }
+    }
+
+    static JsonValue NewTool(string name, string desc) {
+        JsonValue schema = JsonValue.NewObject();
+        schema.Put("type", JsonValue.NewStr("object"));
+        schema.Put("properties", JsonValue.NewObject());
+        schema.Put("required", JsonValue.NewArray());
+        JsonValue t = JsonValue.NewObject();
+        t.Put("name", JsonValue.NewStr(name));
+        t.Put("description", JsonValue.NewStr(desc));
+        t.Put("inputSchema", schema);
+        return t;
+    }
+
+    /// Adds one parameter to a tool's inputSchema, with its JSON type and
+    /// description, and records it in `required` when it is mandatory.
+    static void AddParam(JsonValue tool, string name, string type, string desc,
+                         bool required) {
+        JsonValue schema = tool.Get("inputSchema");
+        if (schema == null) { return; }
+        JsonValue props = schema.Get("properties");
+        if (props == null) { return; }
+        JsonValue p = JsonValue.NewObject();
+        p.Put("type", JsonValue.NewStr(type));
+        p.Put("description", JsonValue.NewStr(desc));
+        props.Put(name, p);
+        if (required) {
+            JsonValue req = schema.Get("required");
+            if (req != null) { req.Append(JsonValue.NewStr(name)); }
+        }
+    }
+
+    // ---- path safety --------------------------------------------------------
+
+    /// Resolves a workspace-relative path to an absolute one, or "" when it
+    /// would escape the workspace. Both separators are accepted, '.' segments
+    /// are dropped, and '..' is rejected outright (rather than resolved, which
+    /// would depend on symlinks). Absolute paths and drive letters are
+    /// rejected: clients must stay inside the workspace.
+    static string Resolve(string rel) {
+        if (rel == "" || rel == "." || rel == "./") { return McpServer.root; }
+        int n = rel.Length;
+        int c0 = rel[0] & 255;
+        if (c0 == 47 || c0 == 92) { return ""; }                 // '/' or '\'
+        if (n > 1 && (rel[1] & 255) == 58) { return ""; }        // 'C:'
+        StringBuilder sb = new StringBuilder();
+        sb.Append(McpServer.root);
+        int start = 0;
+        int i = 0;
+        while (i <= n) {
+            bool end = i == n;
+            bool sep = false;
+            if (!end) {
+                int c = rel[i] & 255;
+                sep = c == 47 || c == 92;
+            }
+            if (end || sep) {
+                int segLen = i - start;
+                if (segLen > 0) {
+                    string seg = rel.Substring(start, segLen);
+                    if (seg == "..") { return ""; }
+                    if (seg != ".") {
+                        sb.Append("/");
+                        sb.Append(seg);
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string TrimTrailingSep(string p) {
+        string s = p;
+        while (s.Length > 1) {
+            int c = s[s.Length - 1] & 255;
+            if (c != 47 && c != 92) { break; }
+            s = s.Substring(0, s.Length - 1);
+        }
+        return s;
+    }
+
+    // ---- small utilities ----------------------------------------------------
+
+    /// Value of `key` in a URL query string, percent-decoded ("" when absent).
+    static string Query(string qs, string key) {
+        int n = qs.Length;
+        int i = 0;
+        while (i < n) {
+            int amp = i;
+            while (amp < n && (qs[amp] & 255) != 38) { amp = amp + 1; }
+            int eq = i;
+            while (eq < amp && (qs[eq] & 255) != 61) { eq = eq + 1; }
+            if (eq < amp && qs.Substring(i, eq - i) == key) {
+                return Encoding.UrlDecode(qs.Substring(eq + 1, amp - eq - 1));
+            }
+            if (eq == amp && qs.Substring(i, amp - i) == key) { return ""; }
+            i = amp + 1;
+        }
+        return "";
+    }
+
+    /// True when the first `n` bytes are well-formed UTF-8 with no NUL, which
+    /// decides whether content can travel as a JSON string or must be base64.
+    /// NUL counts as binary: a Zan string is NUL-terminated, so text carrying
+    /// 0x00 would be silently cut short on the way out.
+    static bool Utf8Valid(byte[] b, int n) {
+        int i = 0;
+        while (i < n) {
+            int c = b[i] & 255;
+            int extra = 0;
+            if (c == 0) { return false; }
+            if (c < 128) { extra = 0; }
+            else if (c >= 194 && c <= 223) { extra = 1; }
+            else if (c >= 224 && c <= 239) { extra = 2; }
+            else if (c >= 240 && c <= 244) { extra = 3; }
+            else { return false; }
+            if (i + extra >= n && extra > 0) { return false; }
+            for (int k = 1; k <= extra; k = k + 1) {
+                int cc = b[i + k] & 255;
+                if (cc < 128 || cc > 191) { return false; }
+            }
+            i = i + extra + 1;
+        }
+        return true;
+    }
+
+    static int Find(string s, string pat) {
+        if (pat.Length == 0) { return 0; }
+        if (s.Length < pat.Length) { return 0 - 1; }
+        int last = s.Length - pat.Length;
+        int first = pat[0] & 255;
+        for (int i = 0; i <= last; i = i + 1) {
+            if ((s[i] & 255) != first) { continue; }
+            int k = 1;
+            while (k < pat.Length && (s[i + k] & 255) == (pat[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == pat.Length) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static int ParseInt(string s, int dflt) {
+        if (s.Length == 0) { return dflt; }
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+            n = n * 10 + (c - 48);
+        }
+        return n;
+    }
+
+    static bool AllDigits(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = s[a] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int c = s[b - 1] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    /// Removes ANSI SGR sequences (ESC '[' ... final letter) so compiler and
+    /// command output stays readable inside JSON.
+    static string StripAnsi(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i < n && (s[i] & 255) != 27) { i = i + 1; }
+        if (i == n) { return s; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(s.Substring(0, i));
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 27 && i + 1 < n && (s[i + 1] & 255) == 91) {
+                i = i + 2;
+                while (i < n) {
+                    int c2 = s[i] & 255;
+                    i = i + 1;
+                    if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122)) { break; }
+                }
+                continue;
+            }
+            sb.Append(s.Substring(i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}

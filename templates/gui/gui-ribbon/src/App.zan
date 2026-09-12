@@ -1,0 +1,12 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/* {{NAME}} 业务逻辑：RibbonTabs 为命令栏（每个选项卡一页），HomeCommands 为首页的工具条。 */
+partial class {{NAME}} {
+    static void OnLoad(Form form) {
+        HomeCommands.OnItemClick((int index) => {
+            MainStatusBar.SetText(0, "命令 " + Convert.ToString(index));
+        });
+    }
+}

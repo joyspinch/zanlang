@@ -1,0 +1,1092 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+/// 聊天页：左栏搜索 + 会话列表，右侧标题 + 气泡聊天 + 底部输入区。
+/// 气泡本身由 `Gui.Component.ChatView` 的气泡模式画（左灰右绿、头像、
+/// 时刻分隔、群聊发言人名字），这里只负责喂数据与装配界面。
+class WxPageChat : Control {
+    Input search;
+    ListView<WxSession> list;
+    ChatView chat;
+    Label headName;
+    Label headDesc;
+    TextArea box;
+    List<WxSession> data;
+    int current;
+    /// 宿主 App（拖出行手势要按主窗口矩形判断「拖到窗外」）。
+    App app;
+    /// 「...」对应的右侧抽屉与输入区上方的弹出面板。
+    Panel drawer;
+    WxDrawerBody drawerBody;
+    Flex popup;
+    WxEmojiPanel emoPanel;
+    WxAvaPanel avaPanel;
+    WxFilePanel filePanel;
+    Control curPopup;
+    /// 输入区下排的图标条：群聊/私聊图标数不同，切会话时重建。
+    ToolStrip bar;
+    /// 点任意用户头像弹出的小名片（与抽屉互斥的右缘浮卡）。
+    WxProfilePanel prof;
+
+    WxPageChat() {
+        this.InitControl("wxPageChat", 5);
+        this.Class = "wxmain";
+        this.data = WxData.Sessions();
+
+        // ---- 左栏：搜索框 + 会话列表 ----
+        Panel col = Wx.Col("wxcol");
+        col.dock = 3;
+        Panel pad = Wx.Col("wxpad");
+        pad.dock = 1;
+        search = new Input("搜索");
+        search.dock = 5;
+        pad.Add(search);
+        col.Add(pad);
+        list = new ListView<WxSession>(WxSessionRow.Of);
+        list.Class = "wxlist";
+        list.dock = 5;
+        list.Bind(data);
+        list.OnSelect(() => { this.Select(list.SelectedIndex()); });
+        col.Add(list);
+        this.Add(col);
+
+        // ---- 右侧会话标题 ----
+        // 头像右侧的四个图标：语音通话/视频通话（摆设）、聊天记录
+        // （开独立记录窗口）、...（开右侧抽屉），与原版同序。
+        Flex head = Wx.Row("wxhead");
+        head.dock = 1;
+        Panel ht = Panel.Column();
+        ht.Class = "grow";
+        headName = Wx.Lbl("", "wxheadname");
+        headDesc = Wx.Lbl("", "wxheaddesc");
+        ht.Add(headName);
+        ht.Add(headDesc);
+        head.Add(ht);
+        Button callBtn = Wx.IconBtn("phone");
+        callBtn.Tip = "语音通话";
+        head.Add(callBtn);
+        Button videoBtn = Wx.IconBtn("video");
+        videoBtn.Tip = "视频通话";
+        head.Add(videoBtn);
+        Button histBtn = Wx.IconBtn("message");
+        histBtn.Tip = "聊天记录";
+        histBtn.OnClick(() => { WxHistoryWindow.Open(this.app, data[current]); });
+        head.Add(histBtn);
+        Button dotsBtn = Wx.IconBtn("dots");
+        dotsBtn.Tip = "更多";
+        dotsBtn.OnClick(() => { this.ToggleDrawer(); });
+        head.Add(dotsBtn);
+        this.Add(head);
+        this.Add(Wx.Line());
+
+        // ---- 底部输入区（按微信的排布：输入框在上，图标与发送
+        //      在底部一条；先加输入区再加它上面的分隔线：dock 2 的
+        //      子节点按插入顺序自下而上排） ----
+        Panel comp = Wx.Col("wxcomposer");
+        comp.dock = 2;
+        Panel tw = Wx.Col("wxtypewrap");
+        tw.dock = 5;
+        box = new TextArea("");
+        box.Class = "wxtype";
+        box.dock = 5;
+        tw.Add(box);
+        comp.Add(tw);
+        Flex bb = Wx.Row("wxbottom");
+        bb.dock = 2;
+        // 图标工具条是标准库的 ToolStrip（按钮组），项本身就是扁平
+        // 按钮（text small），表面色走皮肤的 toolstrip 规则——这里
+        // 不摆裸按钮、不写一行式样；grow 把右侧两个按钮推到最右。
+        // 左组五个按原版顺序：表情 / 常用头像 / 文件 / 截图(+下拉) /
+        // 麦克风，群聊再加一个 ⊙；右组是发语音圆钮与文字发送钮。
+        bar = new ToolStrip();
+        bar.SetIconOnly(true);
+        bar.Class = "grow";
+        bb.Add(bar);
+        Button send = new Button("发送");
+        send.Class = "primary small";
+        send.OnClick(() => { this.Send(); });
+        bb.Add(send);
+        comp.Add(bb);
+        this.Add(comp);
+        this.Add(Wx.Line());
+
+        // ---- 输入区上方的弹出面板（表情 / 常用头像 / 文件）----
+        // dock 2 的第三个子节点：排在分隔线之上、聊天记录之下，
+        // 显隐靠 visible，不做浮层。
+        // 弹出面板的宿主用 flex 列 + 交叉轴起点：面板自己的宽度
+        // （424）才会生效，否则 Panel 的列会把子项拉满整行。
+        popup = Flex.Column();
+        popup.AddClass("wxpopup");
+        popup.AlignStart();
+        popup.dock = 2;
+        popup.visible = false;
+        emoPanel = WxEmojiPanel.Of((t) => { this.Type(t); });
+        emoPanel.Root().visible = false;
+        popup.Add(emoPanel.Root());
+        avaPanel = WxAvaPanel.Of((t) => { this.Type(t); });
+        avaPanel.Root().visible = false;
+        popup.Add(avaPanel.Root());
+        filePanel = WxFilePanel.Of((t) => { this.Type(t); });
+        filePanel.Root().visible = false;
+        popup.Add(filePanel.Root());
+        this.Add(popup);
+
+        // ---- 「...」的右侧抽屉（私聊/群聊两种版式在同一列里翻）----
+        drawer = Wx.Col("wxdrawer");
+        drawer.dock = 4;
+        drawer.visible = false;
+        drawerBody = WxDrawerBody.Of(
+            () => { WxHistoryWindow.Open(this.app, data[current]); },
+            () => { this.ClearCurrent(); },
+            (nm, ini, tint) => { this.ShowProfile(nm, ini, tint); });
+        drawerBody.Root().dock = 5;
+        drawer.Add(drawerBody.Root());
+        this.Add(drawer);
+
+        // ---- 资料名片：点任意用户头像弹出（右缘浮卡，与抽屉互斥）----
+        prof = WxProfilePanel.Of();
+        prof.dock = 4;
+        this.Add(prof);
+
+        // ---- 聊天记录本体 ----
+        chat = new ChatView();
+        chat.Class = "wxchat";
+        chat.dock = 5;
+        chat.WithStyle(ChatStyle.Bubble());
+        chat.WithBubbleWidth(620);
+        // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
+        chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
+        this.Add(chat);
+
+        this.Select(0);
+    }
+
+    /// 把一段文字（表情 / @名片 / 文件占位）追加进输入框。
+    void Type(string t) {
+        box.SetText(box.GetText() + t);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 弹出面板的显隐：再点同一个图标等于收起；互斥——开一个关
+    /// 其余，开面板时也收起抽屉。
+    void ShowPopup(Control p) {
+        if (popup.visible && curPopup == p) {
+            this.ClosePopups();
+            return;
+        }
+        curPopup = p;
+        emoPanel.Root().visible = p == emoPanel.Root();
+        avaPanel.Root().visible = p == avaPanel.Root();
+        filePanel.Root().visible = p == filePanel.Root();
+        drawer.visible = false;
+        prof.Hide();
+        popup.visible = true;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void ClosePopups() {
+        curPopup = null;
+        popup.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 抽屉显隐；打开前把内容对齐到当前会话（私聊/群聊版式翻面）。
+    void ToggleDrawer() {
+        this.ClosePopups();
+        prof.Hide();
+        drawerBody.Show(data[current]);
+        drawer.visible = !drawer.visible;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 点气泡头像弹名片：user = 我；带 agent 的按发言人注册表解析；
+    /// 其余（一对一的对方）用会话名。原版单点头像就是这个名片。
+    void OpenMsgProfile(int idx) {
+        if (idx < 0 || idx >= data[current].msgs.Count) { return; }
+        ChatMessage m = data[current].msgs[idx];
+        if (m.role == "user") {
+            this.ShowProfileCard(WxProfiles.Me());
+            return;
+        }
+        if (m.agent != "") {
+            string nm = WxData.NameOf(m.agent);
+            if (nm != null) {
+                this.ShowProfileCard(WxProfiles.Of(nm,
+                    WxData.IniOf(m.agent), WxData.TintOfId(m.agent)));
+                return;
+            }
+        }
+        WxSession s = data[current];
+        this.ShowProfileCard(WxProfiles.Of(s.name, s.initial, s.tint));
+    }
+
+    /// 弹名片（按数据）；抽屉与弹出面板一并收起——它们与名片同一
+    /// 一块右缘/弹出区，叠着就是自检报的重叠。
+    void ShowProfileCard(WxProfileCard c) {
+        this.ClosePopups();
+        drawer.visible = false;
+        prof.Show(c);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 弹名片（按 名字/首字/色调；抽屉与群成员格走这条）。
+    void ShowProfile(string nm, string ini, string tint) {
+        this.ShowProfileCard(WxProfiles.Of(nm, ini, tint));
+    }
+
+    /// 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
+    /// （抽屉底部那行红字）。
+    void ClearCurrent() {
+        WxSession s = data[current];
+        s.msgs.Clear();
+        s.snippet = "";
+        chat.Reset();
+        chat.Bind(s.msgs);
+        chat.Invalidate();
+        list.Refresh();
+        drawer.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 输入区下排的图标条。两版式的并集只建一次（表情 / 常用头像 /
+    /// 文件 / 截图 / 截图下拉 / 麦克风 / 群目标 + 右组发语音），切会话
+    /// 只翻群目标图标的显隐——ToolStrip 的项表不随 RemoveAll 清空，
+    /// 每次重建会让 ItemAt 拿到旧项。
+    void BuildBar(bool group) {
+        if (bar.Count() > 0) {
+            Wx.Item(bar, 6).visible = group;
+            return;
+        }
+        bar.Add("", "mood-smile");
+        bar.Add("", "box");
+        bar.Add("", "folder");
+        bar.Add("", "scissors");
+        bar.Add("", "caret-down");
+        bar.Add("", "microphone");
+        bar.Add("", "target");
+        Wx.Item(bar, 0).Tip = "表情";
+        Wx.Item(bar, 0).OnClick(() => { this.ShowPopup(emoPanel.Root()); });
+        Wx.Item(bar, 1).Tip = "常用头像";
+        Wx.Item(bar, 1).OnClick(() => { this.ShowPopup(avaPanel.Root()); });
+        Wx.Item(bar, 2).Tip = "文件";
+        Wx.Item(bar, 2).OnClick(() => { this.ShowPopup(filePanel.Root()); });
+        Wx.Item(bar, 3).Tip = "截图";
+        Wx.Item(bar, 4).Tip = "截图范围";
+        Wx.Item(bar, 5).Tip = "麦克风";
+        Wx.Item(bar, 6).Tip = "群目标";
+        int voice = bar.AddRight("", "volume");
+        Wx.Item(bar, voice).AddClass("wxvoice");
+        Wx.Item(bar, voice).Tip = "发语音";
+        Wx.Item(bar, 6).visible = group;
+    }
+
+    /// 切到一个会话：换标题，换整份记录（Reset 会清掉重排缓存与滚动），
+    /// 一对一会话关掉发言人名字、用对方的昵称当左侧气泡的署名；
+    /// 抽屉与弹出面板一并收起，图标条按群聊/私聊翻群目标图标。
+    void Select(int i) {
+        if (i < 0 || i >= data.Count) { return; }
+        current = i;
+        WxSession s = data[i];
+        headName.Text = s.name;
+        if (s.group) {
+            headDesc.Text = "群聊 · " + Convert.ToString(s.people) + " 人";
+        } else {
+            headDesc.Text = "最后活跃 " + s.time;
+        }
+        this.BuildBar(s.group);
+        this.ClosePopups();
+        drawer.visible = false;
+        ChatStrings cs = ChatStrings.Default();
+        cs.you = "我";
+        cs.assistant = s.name;
+        cs.empty = "还没有消息";
+        chat.WithStrings(cs);
+        chat.WithSpeakerNames(s.group);
+        chat.WithSpeakers(WxData.Speaker, WxData.KindLabel);
+        chat.Reset();
+        chat.Bind(s.msgs);
+        chat.Invalidate();
+    }
+
+    /// 发送：把输入框里的正文追加到当前会话，并同步列表行上的摘要。
+    void Send() {
+        string t = box.GetText();
+        if (t == "") { return; }
+        WxSession s = data[current];
+        ChatMessage m = ChatMessage.Create("user", t);
+        m.at = DateTime.UtcNow().ToUnixSeconds();
+        s.msgs.Add(m);
+        s.snippet = t;
+        s.time = "刚刚";
+        s.unread = 0;
+        box.SetText("");
+        chat.Invalidate();
+        list.Refresh();
+    }
+
+    /// 绑定宿主 App，并接上「会话行拖出列表成独立窗口」手势。
+    void UseDetach(App a) {
+        this.app = a;
+        list.OnDragOut((i) => { this.Detach(i); });
+    }
+
+    /// 行被拖出列表之后：只有拖到主窗口之外才开独立窗口。原版行为
+    /// 如此——窗口内拖放不开窗，那次手势留给列表自己的滚动/选择。
+    void Detach(int i) {
+        if (this.app == null || i < 0 || i >= data.Count) { return; }
+        int mx = this.app.mouseX;
+        int my = this.app.mouseY;
+        if (mx >= 0 && mx < this.app.ClientWidth()
+            && my >= 0 && my < this.app.ClientHeight()) { return; }
+        WxChatWindow.Open(this.app, data[i], () => { this.OnForeignSend(i); });
+    }
+
+    /// 浮窗里发出消息后回到主窗口：刷新列表摘要；当前会话跟着重绑
+    /// （同一条记录，重绑等于把新消息滚进视野）。
+    void OnForeignSend(int i) {
+        list.Refresh();
+        if (i == current) { this.Select(i); }
+    }
+
+    override string Kind() { return "WxPageChat"; }
+}
+
+/// 通讯录页：左栏是「通讯录管理」入口 + 六个可折叠的分组节（新的朋友/
+/// 群聊/公众号、服务号/企业微信联系人/我的企业/联系人——chevron + 计数，
+/// 点节行折叠/展开，展开后是该节的字母分组与内容行）；右栏按选中行的
+/// 种类换资料卡：联系人与企业关系共用一张键名可变的卡，群聊、公众号
+/// 各有专属卡——不同分组的操作界面就是这么差异化的。
+class WxPageContacts : Control {
+    App app;
+    List<WxContact> all;        // 完整数据（六节内容都在）
+    List<WxContact> view;       // 按折叠状态重建出来的可见行
+    ListView<WxContact> list;
+
+    // 资料卡 A：联系人 / 好友申请 / 企业关系共用，分节标题与行的键名
+    // 随种类改写（朋友资料 ↔ 企业信息 ↔ 验证消息）。
+    Panel cardA;
+    Avatar dAva;
+    Avatar dAvaCorp;   // 公司行没有首字：蓝色楼宇图标头像
+    Label dName;
+    Label dSub;
+    Label secA1;
+    Label secA2;
+    WxRow dRemark;
+    WxRow dTag;
+    WxRow dRegion;
+    WxRow dSign;
+    WxRow dSource;
+    WxRow dAdded;
+    Button msgBtn;
+    Button voiceBtn;
+    Button videoBtn;
+    // 资料卡 B：群聊专属（我的群昵称/群公告/保存到通讯录）。
+    Panel cardB;
+    Avatar gAva;
+    Label gName;
+    Label gSub;
+    WxRow gNick;
+    WxRow gNotice;
+    WxRow gSave;
+    // 资料卡 C：公众号专属（功能介绍/认证主体）。
+    Panel cardC;
+    Avatar cAva;
+    Label cName;
+    Label cSub;
+    WxRow cIntro;
+    WxRow cSubject;
+    Label hint;
+    WxContact cur;
+
+    WxPageContacts() {
+        this.InitControl("wxPageContacts", 5);
+        this.Class = "wxmain";
+        this.all = WxData.Contacts();
+        this.view = new List<WxContact>();
+        // 默认展开「联系人」节：与原版一致，一进来就能看到字母列表。
+        this.MarkOpen(5, true);
+
+        Panel col = Wx.Col("wxcol");
+        col.dock = 3;
+        // 「通讯录管理」入口：图标 + 文字的一整条按钮（图标走 IconView，
+        // Segoe 图标集里没有通讯簿这个字形）。点开独立的管理子窗口。
+        Flex mg = Wx.Row("wxmgmt");
+        mg.dock = 1;
+        Action openMgmt = () => {
+            if (this.app != null) { WxContactManagerWindow.Open(this.app); }
+        };
+        IconView mi = new IconView("address-book", 18);
+        Label mt = Wx.Lbl("通讯录管理", "wxmgmttext");
+        mg.Justify("center");
+        mg.OnClick(openMgmt);
+        mi.OnClick(openMgmt);
+        mt.OnClick(openMgmt);
+        mg.Add(mi);
+        mg.Add(mt);
+        col.Add(mg);
+
+        list = new ListView<WxContact>(WxContactRow.Of);
+        list.Class = "wxlist";
+        list.dock = 5;
+        list.Bind(view);
+        // 字母头只是分节标题：不可选、不可点。
+        list.WithSelectable(WxContactRow.Selectable);
+        list.OnSelect(() => { this.Pick(list.SelectedIndex()); });
+        // 第二次点同一行走 Activate：对节行就是「再点一下收起」；
+        // 对内容行等于再看一眼卡片，无害。
+        list.OnActivate(() => { this.Pick(list.SelectedIndex()); });
+        col.Add(list);
+        this.Add(col);
+        this.Rebuild();
+
+        // 右侧三张卡叠在同一矩形里，只亮选中行对应的那张——隐藏的
+        // 不参与排版/命中/绘制。
+        Panel card = Wx.Col("wxcard");
+        card.dock = 5;
+        cardA = this.BuildPersonCard();
+        cardB = this.BuildGroupCard();
+        cardC = this.BuildAccountCard();
+        card.Add(cardA);
+        card.Add(cardB);
+        card.Add(cardC);
+        hint = Wx.Lbl("", "wxhint");
+        hint.dock = 2;
+        card.Add(hint);
+        this.Add(card);
+        this.ShowCard(0);
+
+        // 初始选中联系人节的第一位真实联系人。
+        this.ShowFirstPerson();
+    }
+
+    /// 宿主 App（「通讯录管理」要开子窗口）。
+    void UseApp(App a) { this.app = a; }
+
+    // ---- 左栏：折叠分组 ------------------------------------------------
+
+    /// 写某节的展开状态（节行在 all 里，open 挂在行模型上）。
+    void MarkOpen(int section, bool on) {
+        for (int i = 0; i < all.Count; i = i + 1) {
+            WxContact c = all[i];
+            if (c.kind == 0 && c.section == section) { c.open = on; return; }
+        }
+    }
+
+    /// 按展开状态重建可见行：节行永远在，内容行只跟展开的节走。
+    void Rebuild() {
+        view.Clear();
+        WxContact sec = null;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            WxContact c = all[i];
+            if (c.kind == 0) {
+                view.Add(c);
+                sec = c;
+                continue;
+            }
+            if (sec != null && sec.open) { view.Add(c); }
+        }
+        list.Bind(view);
+        if (this.app != null) { this.app.RequestRedraw(); }
+    }
+
+    /// 列表选中：节行翻折叠，其余换资料卡。
+    void Pick(int i) {
+        if (i < 0 || i >= view.Count) { return; }
+        WxContact c = view[i];
+        if (c.kind == 0) {
+            c.open = !c.open;
+            this.Rebuild();
+            return;
+        }
+        if (c.kind == 1) { return; }
+        this.Show(c);
+    }
+
+    void ShowFirstPerson() {
+        for (int i = 0; i < view.Count; i = i + 1) {
+            if (view[i].kind == 2) { this.Show(view[i]); return; }
+        }
+    }
+
+    // ---- 右栏：三种资料卡 ----------------------------------------------
+
+    /// 资料卡 A（联系人 / 好友申请 / 企业关系）。
+    Panel BuildPersonCard() {
+        Panel inner = Wx.Col("wxdetail");
+        inner.dock = 5;
+        Flex top = Wx.Row("");
+        dAva = Wx.Ava("", 64, "primary");
+        dAva.dock = 3;
+        dAvaCorp = Wx.AvaIcon("building", 64, "info");
+        dAvaCorp.dock = 3;
+        dAvaCorp.visible = false;
+        top.Add(dAva);
+        top.Add(dAvaCorp);
+        Panel tp = Panel.Column();
+        tp.Class = "grow";
+        dName = Wx.Lbl("", "wxdname");
+        dSub = Wx.Lbl("", "wxdsub");
+        tp.Add(dName);
+        tp.Add(dSub);
+        top.Add(tp);
+        inner.Add(top);
+        secA1 = Wx.Sec("朋友资料");
+        inner.Add(secA1);
+        dRemark = WxRow.Of("备注", "", "wxdrow", "wxdkey", "wxdval");
+        dTag = WxRow.Of("标签", "", "wxdrow", "wxdkey", "wxdval");
+        dRegion = WxRow.Of("地区", "", "wxdrow", "wxdkey", "wxdval");
+        inner.Add(dRemark.Row());
+        inner.Add(dTag.Row());
+        inner.Add(dRegion.Row());
+        secA2 = Wx.Sec("更多信息");
+        inner.Add(secA2);
+        dSign = WxRow.Of("个性签名", "", "wxdrow", "wxdkey", "wxdval");
+        dSource = WxRow.Of("来源", "", "wxdrow", "wxdkey", "wxdval");
+        dAdded = WxRow.Of("添加时间", "", "wxdrow", "wxdkey", "wxdval");
+        inner.Add(dSign.Row());
+        inner.Add(dSource.Row());
+        inner.Add(dAdded.Row());
+        Flex acts = Wx.Row("wxacts");
+        msgBtn = new Button("发消息");
+        msgBtn.Class = "primary";
+        msgBtn.OnClick(() => { this.Ping("已打开与「" + cur.name + "」的会话"); });
+        voiceBtn = new Button("语音聊天");
+        voiceBtn.OnClick(() => { this.Ping("正在呼叫「" + cur.name + "」的语音"); });
+        videoBtn = new Button("视频聊天");
+        videoBtn.OnClick(() => { this.Ping("正在呼叫「" + cur.name + "」的视频"); });
+        acts.Add(msgBtn);
+        acts.Add(voiceBtn);
+        acts.Add(videoBtn);
+        inner.Add(acts);
+        return inner;
+    }
+
+    /// 资料卡 B（群聊）：群名称在标题位，其余三行是群专属字段。
+    Panel BuildGroupCard() {
+        Panel inner = Wx.Col("wxdetail");
+        inner.dock = 5;
+        Flex top = Wx.Row("");
+        gAva = Wx.Ava("", 64, "info");
+        gAva.dock = 3;
+        top.Add(gAva);
+        Panel tp = Panel.Column();
+        tp.Class = "grow";
+        gName = Wx.Lbl("", "wxdname");
+        gSub = Wx.Lbl("", "wxdsub");
+        tp.Add(gName);
+        tp.Add(gSub);
+        top.Add(tp);
+        inner.Add(top);
+        inner.Add(Wx.Sec("群聊信息"));
+        gNick = WxRow.Of("我的群昵称", "", "wxdrow", "wxdkey", "wxdval");
+        gNotice = WxRow.Of("群公告", "", "wxdrow", "wxdkey", "wxdval");
+        gSave = WxRow.Of("保存到通讯录", "", "wxdrow", "wxdkey", "wxdval");
+        inner.Add(gNick.Row());
+        inner.Add(gNotice.Row());
+        inner.Add(gSave.Row());
+        Flex acts = Wx.Row("wxacts");
+        Button send = new Button("发消息");
+        send.Class = "primary";
+        send.OnClick(() => { this.Ping("已打开群聊「" + cur.name + "」"); });
+        acts.Add(send);
+        inner.Add(acts);
+        return inner;
+    }
+
+    /// 资料卡 C（公众号/服务号）：功能介绍与认证主体，操作只剩发消息。
+    Panel BuildAccountCard() {
+        Panel inner = Wx.Col("wxdetail");
+        inner.dock = 5;
+        Flex top = Wx.Row("");
+        cAva = Wx.Ava("", 64, "primary");
+        cAva.dock = 3;
+        top.Add(cAva);
+        Panel tp = Panel.Column();
+        tp.Class = "grow";
+        cName = Wx.Lbl("", "wxdname");
+        cSub = Wx.Lbl("", "wxdsub");
+        tp.Add(cName);
+        tp.Add(cSub);
+        top.Add(tp);
+        inner.Add(top);
+        inner.Add(Wx.Sec("账号信息"));
+        cIntro = WxRow.Of("功能介绍", "", "wxdrow", "wxdkey", "wxdval");
+        cSubject = WxRow.Of("认证主体", "", "wxdrow", "wxdkey", "wxdval");
+        inner.Add(cIntro.Row());
+        inner.Add(cSubject.Row());
+        Flex acts = Wx.Row("wxacts");
+        Button send = new Button("发消息");
+        send.Class = "primary";
+        send.OnClick(() => { this.Ping("已打开与「" + cur.name + "」的会话"); });
+        acts.Add(send);
+        inner.Add(acts);
+        return inner;
+    }
+
+    /// 只亮一张卡（0=A 1=B 2=C）。
+    void ShowCard(int n) {
+        cardA.visible = n == 0;
+        cardB.visible = n == 1;
+        cardC.visible = n == 2;
+    }
+
+    /// 刷新右栏：按行种类挑卡、按分组改键名与按钮组——分组之间的
+    /// 操作界面差异都落在这里。
+    void Show(WxContact c) {
+        cur = c;
+        if (c.kind == 4) {
+            this.ShowCard(1);
+            gAva.Text = c.initial;
+            gAva.Class = c.tint;
+            gName.Text = c.name;
+            gSub.Text = "群聊 · " + Convert.ToString(c.people) + " 人";
+            gNick.SetVal(c.remark == "" ? "—" : c.remark);
+            gNotice.SetVal(c.tag == "" ? "—" : c.tag);
+            gSave.SetVal("是");
+            hint.Text = "";
+            return;
+        }
+        if (c.kind == 5) {
+            this.ShowCard(2);
+            cAva.Text = c.initial;
+            cAva.Class = c.tint;
+            cName.Text = c.name;
+            cSub.Text = "微信号：" + c.wxid;
+            cIntro.SetVal(c.msg);
+            cSubject.SetVal(c.org);
+            hint.Text = "";
+            return;
+        }
+        this.ShowCard(0);
+        dAva.Text = c.initial;
+        dAva.Class = c.tint;
+        dAva.visible = c.initial != "";
+        dAvaCorp.visible = c.initial == "";
+        dName.Text = c.name;
+        if (c.kind == 3) {
+            // 好友申请：键换成验证语境，语音/视频按钮收起来。
+            secA1.Text = "新的朋友";
+            dSub.Text = c.done ? "已添加" : "等待验证";
+            dRemark.SetKey("验证消息");
+            dRemark.SetVal(c.msg);
+            dTag.SetKey("来源");
+            dTag.SetVal(c.source);
+            dRegion.SetKey("添加时间");
+            dRegion.SetVal(c.added);
+            secA2.Text = "更多信息";
+            dSign.SetKey("个性签名");
+            dSign.SetVal("—");
+            dSource.SetKey("来源");
+            dSource.SetVal(c.source);
+            dAdded.SetKey("添加时间");
+            dAdded.SetVal(c.added);
+            msgBtn.visible = true;
+            voiceBtn.visible = false;
+            videoBtn.visible = false;
+            hint.Text = "";
+            return;
+        }
+        if (c.kind == 6) {
+            // 企业关系：第一段换成企业信息。
+            secA1.Text = "企业信息";
+            dSub.Text = c.role == "我的企业" ? "我的企业" : c.org;
+            dRemark.SetKey("企业");
+            dRemark.SetVal(c.org);
+            dTag.SetKey("职务");
+            dTag.SetVal(c.role);
+            dRegion.SetKey("地区");
+            dRegion.SetVal("—");
+            secA2.Text = "更多信息";
+            dSign.SetKey("个性签名");
+            dSign.SetVal(c.signature == "" ? "—" : c.signature);
+            dSource.SetKey("来源");
+            dSource.SetVal(c.section == 4 ? "我的企业" : "企业微信");
+            dAdded.SetKey("添加时间");
+            dAdded.SetVal("—");
+            msgBtn.visible = true;
+            voiceBtn.visible = c.initial != "";
+            videoBtn.visible = c.initial != "";
+            hint.Text = "";
+            return;
+        }
+        // 联系人（kind 2）。
+        secA1.Text = "朋友资料";
+        dSub.Text = "微信号：" + c.wxid;
+        dRemark.SetKey("备注");
+        dRemark.SetVal(c.remark);
+        dTag.SetKey("标签");
+        dTag.SetVal(c.tag);
+        dRegion.SetKey("地区");
+        dRegion.SetVal(c.region);
+        secA2.Text = "更多信息";
+        dSign.SetKey("个性签名");
+        dSign.SetVal(c.signature);
+        dSource.SetKey("来源");
+        dSource.SetVal(c.source);
+        dAdded.SetKey("添加时间");
+        dAdded.SetVal(c.added);
+        msgBtn.visible = true;
+        voiceBtn.visible = true;
+        videoBtn.visible = true;
+        hint.Text = "";
+    }
+
+    void Ping(string t) {
+        if (cur != null) { hint.Text = t; }
+    }
+
+    override string Kind() { return "WxPageContacts"; }
+}
+
+/// 收藏页：左栏筛选项，右侧标题行 + 卡片列表 + 容量页脚。
+class WxPageFavorites : Control {
+    ListView<string> filters;
+    ListView<WxFav> cards;
+    Label head;
+    List<string> names;
+    List<WxFav> all;
+    List<WxFav> shown;
+    int cur;
+
+    WxPageFavorites() {
+        this.InitControl("wxPageFavorites", 5);
+        this.Class = "wxmain";
+        names = new List<string>();
+        names.Add("全部收藏");
+        names.Add("最近使用");
+        names.Add("链接");
+        names.Add("图片与视频");
+        names.Add("文件");
+        names.Add("聊天记录");
+        names.Add("位置");
+        names.Add("标签");
+        all = WxData.Favs();
+        shown = new List<WxFav>();
+
+        Panel col = Wx.Col("wxfilters");
+        col.dock = 3;
+        filters = new ListView<string>(WxFilterRow.Of);
+        filters.Class = "wxlist";
+        filters.dock = 5;
+        filters.Bind(names);
+        filters.OnSelect(() => { this.Filter(filters.SelectedIndex()); });
+        col.Add(filters);
+        this.Add(col);
+
+        Panel right = Wx.Col("wxfavs");
+        right.dock = 5;
+        Flex hd = Wx.Row("wxfavhead");
+        head = Wx.Lbl("全部收藏", "wxfavtitle");
+        hd.Add(head);
+        right.Add(hd);
+        right.Add(Wx.Line());
+        cards = new ListView<WxFav>(WxFavRow.Of);
+        cards.Class = "wxlist";
+        cards.dock = 5;
+        right.Add(cards);
+        right.Add(Wx.Line());
+        Flex ft = Wx.Row("wxfavfoot");
+        ft.dock = 2;
+        ft.Add(Wx.Lbl("已使用 148.6M，还剩 3.2G", "wxfavfoottxt"));
+        right.Add(ft);
+        this.Add(right);
+
+        this.Filter(0);
+    }
+
+    /// 按类型筛选。「最近使用」不是类型而是时间口径，取最近的前几条。
+    void Filter(int i) {
+        if (i < 0 || i >= names.Count) { i = 0; }
+        cur = i;
+        string kind = names[i];
+        List<WxFav> next = new List<WxFav>();
+        for (int k = 0; k < all.Count; k = k + 1) {
+            bool hit = i == 0 || all[k].kind == kind;
+            if (i == 1 && k < 5) { hit = true; }
+            if (hit) { next.Add(all[k]); }
+        }
+        shown = next;
+        head.Text = kind + "（" + Convert.ToString(shown.Count) + "）";
+        cards.Bind(shown);
+    }
+
+    override string Kind() { return "WxPageFavorites"; }
+}
+
+/// 设置层窗口里的内容：左列导航，右侧六个分区（只让当前分区可见，
+/// 六个分区共用同一条保留的控件树，切换不重建控件）。
+class WxSettingsView : Control {
+    Panel body;
+    List<Panel> secs;
+    List<Button> navs;
+    List<string> titles;
+    int cur;
+
+    WxSettingsView(App app) {
+        this.InitControl("wxSettingsView", 5);
+        this.Class = "wxset";
+        Panel nav = Wx.Col("wxsetnav");
+        nav.dock = 3;
+        body = Wx.Col("wxsetbody");
+        body.dock = 5;
+        this.Add(nav);
+        this.Add(body);
+
+        titles = new List<string>();
+        titles.Add("账号与存储");
+        titles.Add("通用");
+        titles.Add("快捷键");
+        titles.Add("通知");
+        titles.Add("插件");
+        titles.Add("关于微信");
+        secs = new List<Panel>();
+        secs.Add(this.SecAccount(app));
+        secs.Add(this.SecGeneral(app));
+        secs.Add(this.SecKeys(app));
+        secs.Add(this.SecNotify(app));
+        secs.Add(this.SecPlugins(app));
+        secs.Add(this.SecAbout(app));
+        for (int i = 0; i < secs.Count; i = i + 1) {
+            body.Add(secs[i]);
+        }
+
+        navs = new List<Button>();
+        for (int i = 0; i < titles.Count; i = i + 1) {
+            Button b = new Button(titles[i]);
+            b.Class = "wxsetnavbtn";
+            nav.Add(b);
+            navs.Add(b);
+            int idx = i;
+            b.OnClick(() => { this.Pick(idx); });
+        }
+        this.Pick(0);
+    }
+
+    void Pick(int i) {
+        if (i < 0 || i >= secs.Count) { return; }
+        cur = i;
+        for (int k = 0; k < secs.Count; k = k + 1) {
+            secs[k].visible = k == i;
+            navs[k].Class = Wx.NavCls(k == i);
+        }
+    }
+
+    Panel SecAccount(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("账号"));
+        Flex r0 = Wx.Row("wxsetrow");
+        r0.Add(Wx.Lbl("退出登录", "wxsetkey grow"));
+        Button quit = new Button("退出登录");
+        quit.Class = "danger";
+        r0.Add(quit);
+        s.Add(r0);
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("登录方式", "自动"));
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("保留聊天记录", "wxsetkey grow"));
+        Switch keep = new Switch();
+        keep.SetOn(false);
+        r2.Add(keep);
+        s.Add(r2);
+        s.Add(Wx.Line());
+        Flex r3 = Wx.Row("wxsetrow");
+        r3.Add(Wx.Lbl("存储空间", "wxsetkey grow"));
+        r3.Add(Wx.Lbl("已使用 148.6M", "wxsetval"));
+        r3.Add(new Button("管理"));
+        s.Add(r3);
+        s.Add(Wx.Line());
+        Flex r4 = Wx.Row("wxsetrow");
+        r4.Add(Wx.Lbl("存储位置", "wxsetkey grow"));
+        r4.Add(Wx.Lbl("D:\\微聊\\数据", "wxsetval"));
+        r4.Add(new Button("更改"));
+        s.Add(r4);
+        s.Add(Wx.Line());
+        Flex r5 = Wx.Row("wxsetrow");
+        r5.Add(Wx.Lbl("自动下载小于", "wxsetkey grow"));
+        SelectBox limit = new SelectBox("20 MB");
+        limit.AddOption("5 MB");
+        limit.AddOption("10 MB");
+        limit.AddOption("20 MB");
+        limit.AddOption("50 MB");
+        r5.Add(limit);
+        r5.Add(Wx.Lbl("的文件", "wxsetkey"));
+        Switch dl = new Switch();
+        dl.SetOn(true);
+        r5.Add(dl);
+        s.Add(r5);
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecGeneral(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("外观"));
+        s.Add(WxRow.Kv("语言", "简体中文"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("字体大小", "标准"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("皮肤", "跟随系统"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("界面缩放", "100%"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecKeys(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("发送与截图"));
+        s.Add(WxRow.Kv("发送消息", "Enter"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("换行", "Ctrl + Enter"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("截图", "Alt + A"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("锁定", "Ctrl + L"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecNotify(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("消息提醒"));
+        Flex r0 = Wx.Row("wxsetrow");
+        r0.Add(Wx.Lbl("新消息提醒", "wxsetkey grow"));
+        Switch n1 = new Switch();
+        n1.SetOn(true);
+        r0.Add(n1);
+        s.Add(r0);
+        s.Add(Wx.Line());
+        Flex r1 = Wx.Row("wxsetrow");
+        r1.Add(Wx.Lbl("声音", "wxsetkey grow"));
+        Switch n2 = new Switch();
+        n2.SetOn(true);
+        r1.Add(n2);
+        s.Add(r1);
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("免打扰时段", "wxsetkey grow"));
+        r2.Add(Wx.Lbl("23:00 - 07:00", "wxsetval"));
+        s.Add(r2);
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecPlugins(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("已安装的插件"));
+        s.Add(WxRow.Kv("剪贴板增强", "已启用"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("代码片段", "已启用"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("插件市场", "浏览"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecAbout(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("版本信息"));
+        s.Add(WxRow.Kv("版本", "1.0.0 (build 20260911)"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("内核", "Zan / Gui 标准库"));
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("检查更新", "wxsetkey grow"));
+        r2.Add(new Button("检查"));
+        s.Add(r2);
+        s.Add(Wx.Line());
+        s.Add(Wx.Lbl("示例数据全部虚构，与任何真实账号无关。", "wxhint"));
+        return s;
+    }
+
+    override string Kind() { return "WxSettingsView"; }
+}
+
+
+/// 朋友圈页：左栏是「发现」入口列（朋友圈/视频号/搜一搜/游戏/小程序，
+/// 只有朋友圈是真的，其余是原版同款的摆设项）；右侧上方是封面（自己的
+/// 名字与头像压在封面右下角，点头像弹自己的名片），下方是帖子流
+/// （头像 + 名字 + 正文 + 图墙 + 时间 + 「···」）。头像可点、长文可展开。
+/// 版式上「左窄导航 + 右信息流」与将来的企业工作台同构。
+class WxPageMoments : Control {
+    ListView<WxPost> feed;
+    WxProfilePanel prof;
+    App app;
+
+    WxPageMoments() {
+        this.InitControl("wxmoments", 5);
+        this.Class = "wxmain";
+
+        // ---- 左栏：发现 ----
+        Panel disc = Wx.Col("wxdisc");
+        disc.dock = 3;
+        disc.Add(Wx.Lbl("发现", "wxdistitle"));
+        disc.Add(this.Entry("compass", "朋友圈", true));
+        disc.Add(this.Entry("device-tv", "视频号", false));
+        disc.Add(this.Entry("search", "搜一搜", false));
+        disc.Add(this.Entry("device-gamepad", "游戏", false));
+        disc.Add(this.Entry("apps", "小程序", false));
+        this.Add(disc);
+
+        // ---- 封面：右下角压着自己的名字与头像（点头像 = 我的名片）----
+        Panel cover = Wx.Col("wxcover");
+        cover.dock = 1;
+        Panel corner = Wx.Col("wxcovercorner");
+        corner.dock = 4;
+        corner.Add(Wx.Lbl("季然", "wxcovername"));
+        Avatar me = Wx.Ava("季", 64, "success");
+        me.AddClass("wxpme");
+        me.OnClick(() => { this.Ask("季然", "季", "success"); });
+        corner.Add(me);
+        cover.Add(corner);
+        this.Add(cover);
+
+        // ---- 帖子流 ----
+        feed = new ListView<WxPost>(WxPostRow.Of);
+        feed.Class = "wxfeed";
+        feed.dock = 5;
+        feed.Bind(WxProfiles.Moments());
+        this.Add(feed);
+
+        // ---- 资料名片（与聊天页同一张卡）----
+        prof = WxProfilePanel.Of();
+        prof.dock = 4;
+        this.Add(prof);
+    }
+
+    /// 「发现」的一行：图标 + 名字；只有当前项亮着，其余是原版
+    /// 同款的摆设项，点了不动。
+    Flex Entry(string icon, string txt, bool on) {
+        Flex e = Wx.Row("wxdentry");
+        IconView ic = new IconView(icon, 20);
+        Label tl = Wx.Lbl(txt, "wxdentrytext");
+        e.Add(ic);
+        e.Add(tl);
+        if (on) {
+            e.SetClassIn("wxon", "wxon");
+            ic.AddClass("wxon");
+            tl.AddClass("wxon");
+        }
+        return e;
+    }
+
+    void Ask(string nm, string ini, string tint) {
+        prof.Show(WxProfiles.Of(nm, ini, tint));
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void UseApp(App a) {
+        this.app = a;
+    }
+
+    override string Kind() { return "WxPageMoments"; }
+}

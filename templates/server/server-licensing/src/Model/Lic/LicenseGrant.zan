@@ -1,0 +1,47 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Lic;
+
+/* 账号授权：sys_user 在某产品上的有效授权。来源可以是后台发放，
+ * 也可以是激活码激活时自动建一行（codeTail 留痕）。
+ * durationDays 语义同激活码；expiresAt = 发放时刻 + durationDays*86400，0=终身。*/
+[Table(Name = "lic_grant")]
+class LicenseGrant {
+    [Column(IsIdentity = true)]
+    int id;
+
+    [Column(IsNullable = false)]
+    int productId;
+
+    /* 激活码来源记其 lic_code.id，账号发放为 0。*/
+    int codeId;
+
+    [Column(IsNullable = false)]
+    int userId;
+
+    [Column(StringLength = 64)]
+    string account;
+
+    /* 30/90/365/0（终身）——发放时决定，到期后心跳被拒。*/
+    int durationDays;
+
+    [Column(IsNullable = false)]
+    long expiresAt;
+
+    /* 0=不限设备；>0 = 最多同时绑定设备数。*/
+    int maxDevices;
+
+    /* 0=不限在线座位；>0 = 同时在线终端上限（心跳保活）。*/
+    int maxSeats;
+
+    /* 1=有效 0=停用。*/
+    int disabled;
+
+    [Column(StringLength = 32)]
+    string codeTail;
+
+    [Column(StringLength = 256)]
+    string note;
+
+    long createdAt;
+}

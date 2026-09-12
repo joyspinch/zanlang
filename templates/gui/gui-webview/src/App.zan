@@ -1,0 +1,127 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.WebView;
+
+/* {{NAME}} 的业务逻辑：多标签浏览器。每页一个 WebViewBox，标签条只决定哪一页可见。 */
+partial class {{NAME}} {
+    static string Home() { return "https://www.example.com"; }
+
+    static List<WebViewBox> views;
+    /* 地址栏当前显示的地址，输入中不被回填覆盖。 */
+    static string shownUrl;
+    static App ui;
+
+    static void OnLoad(Form form) {
+        views = new List<WebViewBox>();
+        views.Add(Tab1View);
+        shownUrl = Tab1View.StartUrl();
+        ui = form.GetApp();
+        BrowserTabs.SetShowAdd(true);
+        AddressBar.SetText(shownUrl);
+
+        NavStrip.OnItemClick((int index) => { {{NAME}}.Command(index); });
+        AddressBar.Submit += () => { {{NAME}}.Go(); };
+        AddressBar.On.Focus += () => { AddressBar.SelectAll(); };
+        BrowserTabs.TabAdded += () => { {{NAME}}.OpenTab(); };
+        BrowserTabs.TabClosed += () => { {{NAME}}.Reap(); };
+        BrowserTabs.TabChanged += () => { {{NAME}}.Switched(); };
+        form.FrameHook(() => { {{NAME}}.Sync(); });
+    }
+
+    /* 工具条命令：0 后退，1 前进，2 刷新，4 新建标签。 */
+    static void Command(int index) {
+        if (index == 4) {
+            BrowserTabs.AddNew();
+            return;
+        }
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        if (index == 0) { v.Back(); }
+        else if (index == 1) { v.Forward(); }
+        else if (index == 2) { v.Reload(); }
+    }
+
+    /* 地址栏回车，在当前标签打开输入地址。 */
+    static void Go() {
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        shownUrl = AddressBar.GetText();
+        v.Navigate(shownUrl);
+    }
+
+    /* 检查用户是否在地址栏编辑中（按焦点判断）。 */
+    static bool Editing() {
+        return ui != null && ui.focus.IsFocused(AddressBar.WidgetId());
+    }
+
+    /* 新标签：AddNew() 之后补一个 WebViewBox。 */
+    static void OpenTab() {
+        int i = BrowserTabs.Active();
+        WebViewBox v = new WebViewBox();
+        BrowserTabs.Page(i).Add(v);
+        if (i >= views.Count) { views.Add(v); }
+        else { views.Insert(i, v); }
+        v.Navigate({{NAME}}.Home());
+        shownUrl = "";
+    }
+
+    /* 标签关闭后清理孤儿 WebViewBox；最后一页关闭时补开一个。 */
+    static void Reap() {
+        List<WebViewBox> keep = new List<WebViewBox>();
+        for (int i = 0; i < views.Count; i = i + 1) {
+            WebViewBox v = views[i];
+            if (v.HostForm() == null) { v.Destroy(); }
+            else { keep.Add(v); }
+        }
+        views = keep;
+        shownUrl = "";
+        if (BrowserTabs.Count() == 0) { BrowserTabs.AddNew(); }
+    }
+
+    static void Switched() {
+        shownUrl = "";
+    }
+
+    static WebViewBox Active() {
+        int i = BrowserTabs.Active();
+        if (i < 0 || i >= views.Count) { return null; }
+        return views[i];
+    }
+
+    /* 每帧回填地址、标题、加载状态。 */
+    static void Sync() {
+        for (int i = 0; i < views.Count; i = i + 1) {
+            string label = views[i].CurrentTitle();
+            if (label == "") { label = "新建标签"; }
+            if (label.Length > 24) { label = label.Substring(0, 24) + "..."; }
+            if (BrowserTabs.LabelAt(i) != label) {
+                BrowserTabs.SetLabel(i, label);
+            }
+        }
+        MainStatusBar.SetText(1, Convert.ToString(views.Count) + " 个标签");
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        string url = v.CurrentUrl();
+        if ({{NAME}}.Editing()) { return; }
+        if (url != "" && url != shownUrl) {
+            shownUrl = url;
+            AddressBar.SetText(url);
+        }
+        MainStatusBar.SetText(0, {{NAME}}.Status(v));
+    }
+
+    static string Status(WebViewBox v) {
+        if (v.IsLoading()) {
+            string req = v.View().LastRequest();
+            if (req == "") { req = v.CurrentUrl(); }
+            return "正在加载 " + req;
+        }
+        string s = v.CurrentTitle();
+        if (v.LastStatus() > 0) {
+            s = s + "  (" + Convert.ToString(v.LastStatus()) + ")";
+        }
+        if (s == "") { s = "就绪"; }
+        return s;
+    }
+}

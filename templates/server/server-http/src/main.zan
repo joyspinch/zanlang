@@ -1,0 +1,32 @@
+using System;
+using System.Net;
+using System.Net.Http;
+
+/* {{NAME}} -- Worker 统一宿主上的最小 HTTP 服务器。 */
+/* accept、keep-alive、请求头解析、超时保护全部由 Worker 内建；业务只写 onHttpRequest 回调（HttpRequest -> HttpResponse）。 */
+/* 每个连接在独立协程上服务；如需完整框架（路由/{param}、限流、认证、钩子、内存视图），改用 "Web MVC Framework" 模板。 */
+class Program {
+    static HttpRouter router;
+
+    static async int Run() {
+        router = new HttpRouter();
+        router.Get("/", "<h1>{{NAME}}</h1><p>Hello from Zan!</p>");
+        router.Get("/ping", "pong");
+
+        Worker server = new Worker("http", "127.0.0.1", 8083);
+        server.onHttpRequest = Program.Handle;
+
+        Console.WriteLine("{{NAME}} listening on http://127.0.0.1:8083");
+        await Worker.RunAll();            /* 永不返回 */
+        return 0;
+    }
+
+    /* 返回 HttpResponse；Worker 负责 keep-alive、序列化与超时。 */
+    static async HttpResponse Handle(HttpRequest req) {
+        return router.Match(req);
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

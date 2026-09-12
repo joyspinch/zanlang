@@ -1,0 +1,32 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Ecbi;
+
+/* 推广日报：按店铺（随平台）记录投放数据。cost 花费(分)，impression/click/cost 通过外部平台报表抽取；orderCount/orderAmount 为推广成交。 */
+[Table(Name = "ods_ad")]
+class OdsAd {
+    [Column(IsIdentity = true)]
+    int id;
+
+    /* 归属租户（软隔离基列，#34）。ORM DDL 不生成 DEFAULT 子句（见 OrmDialect.Ty），
+       列默认由字段初始化器保证：所有 new OdsAd() 插入路径写 1。 */
+    [Column(IsNullable = false)]
+    int tenantId = 1;
+
+    int shopId;
+
+    [Column(StringLength = 64)]
+    string campaign;
+
+    long day;
+
+    long cost;
+
+    long impression;
+
+    long click;
+
+    int orderCount;
+
+    long orderAmount;
+}

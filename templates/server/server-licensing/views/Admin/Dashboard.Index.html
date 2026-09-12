@@ -1,0 +1,39 @@
+<div class="grid c6">
+  <div class="card kpi"><div class="k">产品</div><div class="v">{{products}}</div></div>
+  <div class="card kpi"><div class="k">可用激活码</div><div class="v">{{codes}}</div></div>
+  <div class="card kpi"><div class="k">账号授权</div><div class="v">{{grants}}</div></div>
+  <div class="card kpi"><div class="k">5 分钟内在线终端</div><div class="v">{{online}}</div></div>
+  <div class="card kpi"><div class="k">绑定设备</div><div class="v">{{devices}}</div></div>
+  <div class="card kpi"><div class="k">请求 / 错误</div><div class="v">{{requests}} / {{errors}}</div><div class="s">平均 {{avg}} · 运行 {{uptime}}</div></div>
+</div>
+
+{{#if dbDown}}
+<div class="card"><div class="empty">数据库当前不可用，授权数据暂时无法显示。</div></div>
+{{/if}}
+
+<div class="card">
+  <h3>最近激活的终端</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th class="num" style="width:64px">ID</th>
+        <th>授权主体</th>
+        <th>设备指纹</th>
+        <th style="width:110px">方式</th>
+        <th style="width:150px">激活时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each recent}}
+      <tr>
+        <td class="num muted">{{id}}</td>
+        <td>{{subject}}</td>
+        <td class="muted mono">{{deviceFp}}</td>
+        <td>{{modeText}}</td>
+        <td class="muted">{{createdAt}}</td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if noRecent}}<div class="empty">还没有终端激活——用客户端 SDK 或 /api/license 下的端点走一遍激活流程</div>{{/if}}
+</div>

@@ -1,0 +1,452 @@
+/// SkinBuilder — Zan Gui Chart 组件的配色配置工具（所见即所得）。
+///
+/// 左侧两列配置：图表调色板（--chart-1..8）与图表部件颜色
+/// （chart::grid / axis / label / legend / mark / accent / tooltip），
+/// 右侧是真实 Chart 组件的实时预览（折柱混搭 + 饼图）。每一帧把
+/// 当前配置写成 draft 皮肤（skins/skinbuilder-draft/skin.css）并
+/// 走 App 的皮肤热重载通道，预览零延迟跟手。
+///
+/// 产出不是皮肤包：图表皮肤只是单个组件的配色，不是整套 UI
+/// 皮肤，不该出现在应用的皮肤选择里——draft 带 `--kind: "chart"`
+/// 标记，标题栏选择器不会列出它（Skin.Names 只收整套 UI 皮肤）。
+/// 底部文本框就是全部产物：一段可复制的 CSS（--chart-N +
+/// chart::* 规则），「复制 CSS」一键进剪贴板，整段粘进应用自己
+/// 的 skin.css 即可生效。
+///
+/// 全部使用标准库组件（ColorPicker/Input/Radio/Button/TextArea/
+/// Label/Panel + Chart），无任何自绘。
+using System;
+using System.IO;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Gui.Component.Chart;
+
+class SkinBuilder {
+    static App app;
+
+    // ---- 配置控件（保留态，跨帧复用） ----
+    static Input nameInput;
+    static RadioGroup baseGroup;
+    static List<ColorPicker> pal;
+    static ColorPicker pGrid;
+    static ColorPicker pAxisLine;
+    static ColorPicker pAxisText;
+    static ColorPicker pAxisTitle;
+    static ColorPicker pLabel;
+    static ColorPicker pLegend;
+    static ColorPicker pMark;
+    static ColorPicker pAccent;
+    static ColorPicker pTipBg;
+    static ColorPicker pTipText;
+    static ColorPicker pTipBorder;
+    static Button resetBtn;
+    static Button copyBtn;
+    static Label status;
+    static Panel colA;
+    static Panel colB;
+
+    // ---- 产物视图 ----
+    static TextArea cssBox;
+    static string shownCss = "";
+
+    // ---- 预览 ----
+    static ChartOption mixOpt;
+    static ChartOption pieOpt;
+
+    // ---- 状态 ----
+    static string draftName = "skinbuilder-draft";
+    static string lastApplied = "";
+
+    static void Main() {
+        // 亮色基底起步（ECharts 示例站观感）；标题栏皮肤选择器开着，
+        // 可随时切到内置皮肤对比。
+        App a = new App("Zan SkinBuilder", 1500, 920);
+        SkinBuilder.app = a;
+        a.EnableSkins(1);
+        SkinBuilder.BuildControls();
+        SkinBuilder.BuildPreviews();
+
+        a.Show();
+        WidgetId.Mark();
+
+        while (a.isRunning) {
+            int r;
+            if (a.needsRedraw) {
+                int since = Window.GetTickMs() - a.lastPresentMs;
+                if (a.lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
+                r = a.window.PollEvent();
+            } else if (a.animNextMs >= 0 || a.fxNextMs >= 0) {
+                // 图表入场动画在 animNextMs 上排队下一帧；没人醒来
+                // 兑现它的话 g 永远停在入场起点，柱条/扇区会压成一条线。
+                r = 1;
+                bool waiting = true;
+                while (waiting) {
+                    int now = Window.GetTickMs();
+                    int deadline = a.animNextMs;
+                    if (deadline < 0
+                        || (a.fxNextMs >= 0 && a.fxNextMs < deadline)) {
+                        deadline = a.fxNextMs;
+                    }
+                    if (deadline < 0) { waiting = false; }
+                    else if (now >= deadline) {
+                        bool fxOnly = a.animNextMs < 0 || now < a.animNextMs;
+                        if (!(fxOnly && a.FxPresent())) {
+                            a.RequestRedraw();
+                            waiting = false;
+                        }
+                    } else {
+                        r = a.window.WaitEventTimeout(deadline - now);
+                        if (r != 1) { waiting = false; }
+                    }
+                }
+            } else {
+                r = a.window.WaitEvent();
+            }
+            if (r < 0) { break; }
+            a.DrainPosts();
+
+            nint evh = Window.EventHwnd();
+            int kind = a.window.EventKind();
+            if (kind == 8) { break; }
+            bool inputEv = kind == 2 || kind == 3 || kind == 13
+                || kind == 4 || kind == 6 || kind == 1;
+            bool doFrame = true;
+            if (!a.needsRedraw && !inputEv) { doFrame = false; }
+            a.ApplyEvent(evh);
+            if (doFrame) {
+                // SafeFrame = 异常护栏版 BeginFrame/body/PresentFrame：
+                // 帧内异常记进 LastFrameError 而不是带崩进程。
+                a.SafeFrame(() => {
+                    WidgetId.ResetFrame();
+                    SkinBuilder.Render(a);
+                    a.RenderChrome("Zan SkinBuilder");
+                });
+            }
+        }
+        // 收尾清掉 draft：预览热重载是它唯一的用途，留着只会在
+        // 磁盘上多一个不可选的皮肤目录。
+        Directory.DeleteRecursive(SkinBuilder.SkinsRoot() + "/" + draftName);
+    }
+
+    // ---- 配置面板 ----------------------------------------------------------
+
+    static ColorPicker Picker(int packed) {
+        ColorPicker p = new ColorPicker(packed);
+        p.SetShowAlpha(false);
+        p.Modes("hex", "", "", "");
+        return p;
+    }
+
+    static Panel Row(string text, Control ctl) {
+        return Panel.Row().Gap(app.Scale(8)) {
+            Children = {
+                new Label { Text = text },
+                ctl,
+            },
+        };
+    }
+
+    static Panel Head(string text) {
+        return Panel.Row().Gap(app.Scale(6)) {
+            Children = {
+                new Label { Text = text, Class = "secondary" },
+            },
+        };
+    }
+
+    static void BuildControls() {
+        nameInput = new Input("my-chart-skin");
+        nameInput.SetText("my-chart-skin");
+
+        baseGroup = new RadioGroup();
+        baseGroup.AddOption("亮色基底");
+        baseGroup.AddOption("暗色基底");
+        baseGroup.SetSelectedValue(0);
+
+        // 调色板初值 = ECharts 2.x 默认定性色（Chart.Palette 的回退序列，
+        // theme/default.js 前 8 档）。
+        SkinBuilder.pal = new List<ColorPicker>();
+        List<int> palDef = new List<int>{
+            (int)0xFFC1232B, (int)0xFFB5C334, (int)0xFFFCCE10,
+            (int)0xFFE87C25, (int)0xFF27727B, (int)0xFFFE8463,
+            (int)0xFF9BCA63, (int)0xFFFAD860 };
+        for (int i = 0; i < 8; i = i + 1) {
+            pal.Add(Picker(palDef[i]));
+        }
+
+        // 部件颜色初值 = base.css 的 ECharts 2.2.7 基线。
+        pGrid = Picker((int)0xFFCCCCCC);
+        pAxisLine = Picker((int)0xFF4488BB);
+        pAxisText = Picker((int)0xFF333333);
+        pAxisTitle = Picker((int)0xFF6E7079);
+        pLabel = Picker((int)0xFF333333);
+        pLegend = Picker((int)0xFF6E7079);
+        pMark = Picker((int)0xFFE43C4E);
+        pAccent = Picker((int)0xFF4488BB);
+        pTipBg = Picker((int)0xFFFFFFFF);
+        pTipText = Picker((int)0xFF333333);
+        pTipBorder = Picker((int)0xFFDDDDDD);
+
+        resetBtn = new Button { Text = "重置为 ECharts 默认" };
+        resetBtn.Click += SkinBuilder.OnReset;
+        copyBtn = new Button { Text = "复制 CSS", Class = "primary" };
+        copyBtn.Click += SkinBuilder.OnCopy;
+        status = new Label { Text = "预览即所得；产物 = 底部 CSS。", Class = "secondary" };
+        cssBox = new TextArea("");
+
+        // 左列 A：调色板 + 预览基底 + 操作。
+        // （Children 是集合初始化器门面，不能整表赋值——逐个 With。）
+        Panel ca = Panel.Column().Gap(app.Scale(6));
+        ca.With(Row("名称", nameInput));
+        ca.With(Head("── 图表调色板（--chart-1..8）──"));
+        for (int i = 0; i < 8; i = i + 1) {
+            ca.With(Row("系列 " + (i + 1), pal[i]));
+        }
+        ca.With(Head("── 预览基底（只影响预览，不进产物）──"));
+        ca.With(Panel.Row().Gap(app.Scale(10)) {
+            Children = { baseGroup },
+        });
+        ca.With(Panel.Row().Gap(app.Scale(10)) {
+            Children = { resetBtn, copyBtn },
+        });
+        ca.With(status);
+        SkinBuilder.colA = ca;
+
+        // 左列 B：图表部件颜色（chart::* 规则）。
+        Panel cb = Panel.Column().Gap(app.Scale(6));
+        cb.With(Head("── 图表部件颜色（chart::*）──"));
+        cb.With(Row("网格线 grid", pGrid));
+        cb.With(Row("轴线 axis", pAxisLine));
+        cb.With(Row("刻度文字", pAxisText));
+        cb.With(Row("轴标题", pAxisTitle));
+        cb.With(Row("数据标签 label", pLabel));
+        cb.With(Row("图例文字 legend", pLegend));
+        cb.With(Row("标记 mark", pMark));
+        cb.With(Row("强调 accent", pAccent));
+        cb.With(Row("提示框底", pTipBg));
+        cb.With(Row("提示框字", pTipText));
+        cb.With(Row("提示框边", pTipBorder));
+        SkinBuilder.colB = cb;
+    }
+
+    static void BuildPreviews() {
+        // 折柱混搭：调色板 1..3 槽 + 轴/网格/标签/图例/标记线全覆盖。
+        ChartSeries bars1 = ChartSeries.Bar("系列A",
+            new List<int>{ 120, 200, 150, 80, 70, 110 });
+        bars1.MarkLine(ChartMarkLine.Average());
+        ChartSeries bars2 = ChartSeries.Bar("系列B",
+            new List<int>{ 90, 130, 110, 95, 125, 140 });
+        ChartSeries line = ChartSeries.Line("趋势",
+            new List<int>{ 60, 110, 130, 90, 140, 160 });
+        line.smooth = 1;
+        SkinBuilder.mixOpt = ChartOption.Of("折柱混搭 · 实时预览",
+            new List<string>{ "1月", "2月", "3月", "4月", "5月", "6月" },
+            new List<ChartSeries>{ bars1, bars2, line });
+        mixOpt.showValues = true;
+
+        // 饼图：调色板 1..5 槽 + 扇区标签/图例。
+        SkinBuilder.pieOpt = ChartOption.Of("占比 · 实时预览",
+            null, new List<ChartSeries>{
+                ChartSeries.Named("q", ChartType.Pie, new List<ChartData>{
+                    ChartData.Named(335, "直接访问"), ChartData.Named(310, "邮件营销"),
+                    ChartData.Named(234, "联盟广告"), ChartData.Named(135, "视频广告"),
+                    ChartData.Named(548, "搜索引擎") }) });
+        pieOpt.donutPct = 40;
+        pieOpt.pieLabels = true;
+    }
+
+    // ---- css 生成 ----------------------------------------------------------
+
+    static string SanitizeName(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "/" || ch == "\\" || ch == ":"
+                || ch == "." || ch == "\"" || ch == "'") { ch = "-"; }
+            outp = outp + ch;
+        }
+        if (outp.Length == 0) { outp = "my-chart-skin"; }
+        return outp;
+    }
+
+    static string NL() { return "\n"; }
+
+    /// 生成的 Chart 皮肤 CSS 文本：`--kind: "chart"` 标记 + 系列调色板
+    /// + chart::* 部件规则。这就是工具的全部产物——整段粘进应用
+    /// 自己的 skin.css 即可，与 UI 皮肤选择无关（kind 非 "ui" 的包
+    /// 不会被 Skin.Names 列出）。draft=true 时附加皮肤包管道令牌
+    /// （--name/--order/--base/--dark），仅驱动本工具的热重载预览，
+    /// 不出现在复制产物里。
+    static string BuildCss(bool draft) {
+        string nl = SkinBuilder.NL();
+        string name = SanitizeName(nameInput.GetText());
+        string s = "/* " + name + " — Zan Gui Chart 组件皮肤（SkinBuilder 生成，整段粘进应用 skin.css） */" + nl;
+        s = s + ":root {" + nl;
+        s = s + "  --kind: \"chart\";" + nl;
+        for (int i = 0; i < 8; i = i + 1) {
+            s = s + "  --chart-" + (i + 1) + ": " + pal[i].Text() + ";" + nl;
+        }
+        if (draft) {
+            string dark = baseGroup.SelectedValue() == 1 ? "1" : "0";
+            string baseTk = baseGroup.SelectedValue() == 1 ? "dark" : "light";
+            s = s + "  --name: \"" + name + "\";" + nl;
+            s = s + "  --order: 900;" + nl;
+            s = s + "  --base: " + baseTk + ";" + nl;
+            s = s + "  --dark: " + dark + ";" + nl;
+        }
+        s = s + "}" + nl;
+        s = s + "chart::grid { background: " + pGrid.Text() + "; }" + nl;
+        s = s + "chart::axis { background: " + pAxisLine.Text()
+            + "; color: " + pAxisText.Text() + "; }" + nl;
+        s = s + "chart::axis-title { color: " + pAxisTitle.Text() + "; }" + nl;
+        s = s + "chart::legend { color: " + pLegend.Text() + "; }" + nl;
+        s = s + "chart::label { color: " + pLabel.Text() + "; }" + nl;
+        s = s + "chart::mark { background: " + pMark.Text()
+            + "; color: " + pMark.Text() + "; }" + nl;
+        s = s + "chart::accent { background: " + pAccent.Text() + "; }" + nl;
+        s = s + "chart::tooltip { background: " + pTipBg.Text()
+            + "; color: " + pTipText.Text()
+            + "; border: 1 " + pTipBorder.Text() + "; }" + nl;
+        return s;
+    }
+
+    static string SkinsRoot() {
+        return Skin.ExeDir() + "/skins";
+    }
+
+    /// 逐级建目录：Win32 CreateDirectoryW 与 POSIX mkdir 都只建
+    /// 最后一级，父级缺失时静默失败——皮肤包目录是嵌套的，直接
+    /// CreateDirectory 会让随后的 WriteAllText 抛 IOException。
+    static void EnsureDir(string path) {
+        if (Directory.ExistsUtf8(path)) { return; }
+        int start = 0;
+        if (path.Length >= 2 && path.Substring(1, 1) == ":") { start = 3; }
+        for (int i = start; i < path.Length; i = i + 1) {
+            string ch = path.Substring(i, 1);
+            if (ch == "/" || ch == "\\") {
+                string part = path.Substring(0, i);
+                // 跳过空段与 "D:" / "D:/" 这类盘根。
+                if (part.Length > 0
+                    && part.Substring(part.Length - 1, 1) != ":") {
+                    Directory.CreateDirectory(part);
+                }
+            }
+        }
+        Directory.CreateDirectory(path);
+    }
+
+    /// 配置有变 → 写 draft 皮肤 → 热重载。每帧开头调用，
+    /// 本帧余下部分即以新皮肤绘制（预览零延迟）。draft 带
+    /// `--kind: "chart"`，只驱动本工具的预览，不会出现在任何
+    /// 应用的 UI 皮肤选择里。
+    static void SyncDraft() {
+        string css = SkinBuilder.BuildCss(true);
+        if (css == SkinBuilder.lastApplied) { return; }
+        string dir = SkinBuilder.SkinsRoot() + "/" + draftName;
+        try {
+            SkinBuilder.EnsureDir(dir);
+            File.WriteAllText(dir + "/skin.css", css);
+        } catch (Exception ex) {
+            SkinBuilder.lastApplied = "";
+            status.Text = "draft 写入失败: " + ex.Message;
+            return;
+        }
+        SkinBuilder.lastApplied = css;
+        if (app.skinName == draftName) {
+            if (!app.ReloadSkin()) { app.UseSkin(draftName); }
+        } else {
+            app.UseSkin(draftName);
+        }
+    }
+
+    // ---- 动作 --------------------------------------------------------------
+
+    static void OnReset() {
+        List<int> palDef = new List<int>{
+            (int)0xFFC1232B, (int)0xFFB5C334, (int)0xFFFCCE10,
+            (int)0xFFE87C25, (int)0xFF27727B, (int)0xFFFE8463,
+            (int)0xFF9BCA63, (int)0xFFFAD860 };
+        for (int i = 0; i < 8; i = i + 1) { pal[i].SetColor(palDef[i]); }
+        pGrid.SetColor((int)0xFFCCCCCC);
+        pAxisLine.SetColor((int)0xFF4488BB);
+        pAxisText.SetColor((int)0xFF333333);
+        pAxisTitle.SetColor((int)0xFF6E7079);
+        pLabel.SetColor((int)0xFF333333);
+        pLegend.SetColor((int)0xFF6E7079);
+        pMark.SetColor((int)0xFFE43C4E);
+        pAccent.SetColor((int)0xFF4488BB);
+        pTipBg.SetColor((int)0xFFFFFFFF);
+        pTipText.SetColor((int)0xFF333333);
+        pTipBorder.SetColor((int)0xFFDDDDDD);
+        baseGroup.SetSelectedValue(0);
+        nameInput.SetText("my-chart-skin");
+        status.Text = "已重置为 ECharts 2 默认。";
+        app.RequestRedraw();
+    }
+
+    /// 把底部文本框里的 CSS（所见即所得）复制到系统剪贴板。
+    static void OnCopy() {
+        string css = cssBox.GetText();
+        if (css.Length == 0) { css = SkinBuilder.BuildCss(false); }
+        Clipboard.SetText(css);
+        status.Text = "已复制 " + css.Length
+            + " 字符的 Chart 皮肤 CSS——整段粘进应用 skin.css 即可。";
+        app.RequestRedraw();
+    }
+
+    // ---- 帧渲染 ------------------------------------------------------------
+
+    static void LayoutCol(Panel root, int x, int y, int w, int availH) {
+        root.HintWrapWidth(w);
+        root.MeasureTree(app);
+        int hh = root.prefH;
+        if (hh < 1) { hh = availH; }
+        root.Arrange(x, y, w, hh);
+        root.RenderTree(app);
+    }
+
+    static void Render(App a) {
+        Canvas c = a.canvas;
+        int top = a.titlebarH;
+        int w = c.Width();
+        int h = c.Height();
+        a.RenderBackground(0, top, w, h - top, 0);
+
+        // 先同步皮肤再布局/绘制：本帧余下部分即以新皮肤渲染。
+        SkinBuilder.SyncDraft();
+
+        int pad = a.Scale(14);
+        int gap = a.Scale(14);
+        int py = top + pad;
+        int availH = h - py - pad;
+        int colW = a.Scale(292);
+        int px = pad;
+
+        // 底部横条 = 全部产物：可复制的 Chart 皮肤 CSS 文本。
+        int stripH = a.Scale(120);
+        int mainH = availH - stripH - gap;
+
+        LayoutCol(colA, px, py, colW, mainH);
+        LayoutCol(colB, px + colW + gap, py, colW, mainH);
+
+        // 右侧：真实 Chart 组件预览（颜色全部来自已应用的皮肤 token）。
+        int cx = px + (colW + gap) * 2;
+        int cw = w - cx - pad;
+        if (cw > a.Scale(200)) {
+            int mixH = (mainH - gap) * 58 / 100;
+            ChartView.Keyed(mixOpt, 700901).Render(a, cx, py, cw, mixH);
+            ChartView.Keyed(pieOpt, 700902).Render(a, cx, py + mixH + gap,
+                cw, mainH - mixH - gap);
+        }
+
+        // 产物文本跟随配置；只在变化时 SetText，避免打断框内
+        // 的选择/滚动。
+        string css = SkinBuilder.BuildCss(false);
+        if (css != SkinBuilder.shownCss) {
+            cssBox.SetText(css);
+            SkinBuilder.shownCss = css;
+        }
+        cssBox.Render(a, px, py + mainH + gap, w - px * 2, stripH);
+    }
+}

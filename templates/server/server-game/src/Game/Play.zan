@@ -1,0 +1,954 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using ZanWeb.Model.Game;
+
+namespace ZanWeb.Game;
+
+/* 玩法页（导航 1/4/5/7/8/10/11/14/16/18/22/23/25）的服务端实现：
+   PK竞技场、押镖、行会、城池争夺、传说塔、五行修炼、师徒、祭坛、
+   将星图谱、发红包、交易市场、图鉴明细、称谓。
+   规则对照客户端离线版 Game.zan 的同名玩法（复刻不创造不阉割）；
+   数值出处 balance.csv / growth.csv / recycle.csv / elements.csv。
+   每日次数照 bossTryDate 定式跨天回满；所有可变状态改会话内存副本
+   并置 dirty，落库随 World.Flush。图鉴明细（codex）挪到这里并按
+   物品/怪物分页，页面一次一页。 */
+class Play {
+    const int ARENA_TRIES = 5;
+    const int ESCORT_TRIES = 3;
+    const int ESCORT_SECONDS = 60;
+    const int ESCORT_GOLD = 100;
+    const int ESCORT_REWARD = 400;
+    const int ESCORT_LEVEL_GOLD = 20;
+    const int ARENA_WIN_MERIT = 100;
+    const int ARENA_LOSE_MERIT = 20;
+    const int ARENA_WIN_GOLD = 200;
+    const int ARENA_POWER_BASE = 200;
+    const int ARENA_POWER_WIN = 180;
+    const int ARENA_POWER_RIVAL = 300;
+    const int ALTAR_PERSONAL_CAP = 1000;
+    const int ALTAR_GOLD_COST = 100;
+    const int ALTAR_GOLD_GAIN = 100;
+    const int ALTAR_YUAN_COST = 100;
+    const int ALTAR_YUAN_GAIN = 5;
+    const int ALTAR_YUAN_LARGE_COST = 1000;
+    const int ALTAR_YUAN_LARGE_GAIN = 50;
+    const int ALTAR_IRON_COST = 500;
+    const int ALTAR_IRON_GAIN = 4;
+    const int ALTAR_PERSONAL_REWARD_GOLD = 1000;
+    const int ALTAR_PERSONAL_REWARD_YUAN = 100;
+    const int ALTAR_PERSONAL_REWARD_REPUTATION = 100;
+    const int ALTAR_BUFF_SECONDS = 1800;
+    /* 五行：name/属性加成每级（攻+2 或血+20），上限 100 级；池上限、
+       每秒入池、突破费用（金币 = 800+级*400，元宝 = 级/2）。 */
+    const int WX_MAX = 100;
+    const int WX_POOL_CAP = 600;
+    const int WX_POOL_PER_SEC = 1;
+    const int WX_XP_BASE = 60;
+    const int WX_XP_STEP = 30;
+    const int WX_IRON_COST = 2;
+    /* 传说塔：层数无限，敌人强度随层增长；每层通关奖励金币与经验。 */
+    const int TOWER_MERIT = 20;
+    /* 原版传说塔每日 10 次（照原版 UI 的 挑战次数 10/10）。 */
+    const int TOWER_MAX_TRIES = 10;
+
+    static Random rng = new Random();
+
+    static string Err(string why) { return why; }
+
+    /* 今天日期（yyyy-MM-dd），BossDaily 同款。 */
+    static string Today(long now) {
+        DateTime dt = DateTime.FromUnixSeconds(now);
+        return Convert.ToString(dt.year) + "-"
+            + (dt.month < 10 ? "0" : "") + Convert.ToString(dt.month) + "-"
+            + (dt.day < 10 ? "0" : "") + Convert.ToString(dt.day);
+    }
+
+    /* towerTries 每日回满也并入 DailyReset。 */
+    static void DailyReset(Session s, long now) {
+        string today = Play.Today(now);
+        if (s.row.arenaTryDate != today) {
+            s.row.arenaTries = ARENA_TRIES;
+            s.row.arenaTryDate = today;
+            s.dirty = true;
+        }
+        if (s.row.escortTryDate != today) {
+            s.row.escortTries = ESCORT_TRIES;
+            s.row.escortTryDate = today;
+            s.dirty = true;
+        }
+        if (s.row.altarDonationDate != today) {
+            s.row.altarDonations = 0;
+            s.row.altarDonationDate = today;
+            s.dirty = true;
+        }
+        if (s.row.towerTryDate != today) {
+            s.row.towerTries = TOWER_MAX_TRIES;
+            s.row.towerTryDate = today;
+            s.dirty = true;
+        }
+    }
+
+    /* ---- 协议 ---- */
+
+    /* arena: {}=面板；{"fight":1..3}=打一场。 */
+    static JsonValue Arena(Session s, JsonValue m, long now) {
+        Play.DailyReset(s, now);
+        if (m.Int("fight", 0) > 0) {
+            int rival = m.Int("fight", 1);
+            if (rival < 1 || rival > 3) { return Gateway.Err("对手编号不合法"); }
+            if (s.row.arenaTries <= 0) { return Gateway.Err("竞技场每日5次，明日再来"); }
+            s.row.arenaTries = s.row.arenaTries - 1;
+            s.row.arenaPts = s.row.arenaPts + ARENA_LOSE_MERIT;
+            int power = Fight.Atk(s.row) * 100 / (Fight.Def(s.row) + 10);
+            int opponent = ARENA_POWER_BASE + (s.row.arenaWins + 1) * ARENA_POWER_WIN
+                + (rival - 1) * ARENA_POWER_RIVAL;
+            int myRoll = power * (Play.rng.Between(80, 130));
+            bool win = myRoll >= opponent * 100;
+            JsonValue r = Gateway.Ok();
+            if (win) {
+                s.row.arenaWins = s.row.arenaWins + 1;
+                s.row.arenaPts = s.row.arenaPts + ARENA_WIN_MERIT - ARENA_LOSE_MERIT;
+                s.row.gold = s.row.gold + ARENA_WIN_GOLD;
+            }
+            r.Set("win", JsonValue.NewNum(win ? "1" : "0"));
+            r.Set("rival", JsonValue.NewNum(Convert.ToString(rival)));
+            r.Set("gold", JsonValue.NewNum(Convert.ToString(win ? ARENA_WIN_GOLD : 0)));
+            r.Set("merit", JsonValue.NewNum(Convert.ToString(win
+                ? ARENA_WIN_MERIT : ARENA_LOSE_MERIT)));
+            r.Set("log", JsonValue.NewStr(win
+                ? "击败对手 " + Convert.ToString(rival) + "！战功 +"
+                    + Convert.ToString(ARENA_WIN_MERIT) + "、金币 +"
+                    + Convert.ToString(ARENA_WIN_GOLD)
+                : "挑战对手 " + Convert.ToString(rival) + " 失败，战功 +"
+                    + Convert.ToString(ARENA_LOSE_MERIT)));
+            Gateway.SelfInto(r, s);
+            s.dirty = true;
+            return r;
+        }
+        return Play.ArenaState(s);
+    }
+
+    static JsonValue ArenaState(Session s) {
+        JsonValue r = Gateway.Ok();
+        JsonValue a = JsonValue.NewObject();
+        a.Set("tries", JsonValue.NewNum(Convert.ToString(s.row.arenaTries)));
+        a.Set("wins", JsonValue.NewNum(Convert.ToString(s.row.arenaWins)));
+        a.Set("pts", JsonValue.NewNum(Convert.ToString(s.row.arenaPts)));
+        a.Set("power", JsonValue.NewNum(Convert.ToString(Fight.Atk(s.row))));
+        r.Set("arena", a);
+        return r;
+    }
+
+    /* escort: {}=面板；{"go":1}=出发；{"collect":1}=到达收镖。 */
+    static JsonValue Escort(Session s, JsonValue m, long now) {
+        Play.DailyReset(s, now);
+        if (m.Int("go", 0) == 1) {
+            if (s.row.escortStage == 1) { return Gateway.Err("镖车已在路上"); }
+            if (s.row.escortTries <= 0) { return Gateway.Err("今日押镖次数已用完，明天再来"); }
+            if (s.row.gold < ESCORT_GOLD) {
+                return Gateway.Err("金币不够（押金 " + Convert.ToString(ESCORT_GOLD) + "）");
+            }
+            s.row.gold = s.row.gold - ESCORT_GOLD;
+            s.row.escortTries = s.row.escortTries - 1;
+            s.row.escortStage = 1;
+            s.row.escortUntil = now + ESCORT_SECONDS;
+            s.row.escortReward = (long)ESCORT_REWARD
+                + (long)s.row.level * ESCORT_LEVEL_GOLD + ESCORT_GOLD;
+            s.dirty = true;
+        }
+        if (m.Int("collect", 0) == 1) {
+            if (s.row.escortStage != 1) { return Gateway.Err("当前没有运输中的镖车"); }
+            if (now < s.row.escortUntil) {
+                return Gateway.Err("镖车还在路上（还差 "
+                    + Convert.ToString(s.row.escortUntil - now) + " 秒）");
+            }
+            long gain = s.row.escortReward;
+            s.row.escortStage = 0;
+            s.row.escortUntil = 0;
+            s.row.escortReward = 0;
+            s.row.gold = s.row.gold + gain;
+            s.row.exp = s.row.exp + 50;
+            s.dirty = true;
+            JsonValue rc = Gateway.Ok();
+            rc.Set("gain", JsonValue.NewNum(Convert.ToString(gain)));
+            rc.Set("escort", Play.EscortState(s, now));
+            Gateway.SelfInto(rc, s);
+            return rc;
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("escort", Play.EscortState(s, now));
+        return r;
+    }
+
+    static JsonValue EscortState(Session s, long now) {
+        JsonValue a = JsonValue.NewObject();
+        a.Set("tries", JsonValue.NewNum(Convert.ToString(s.row.escortTries)));
+        a.Set("stage", JsonValue.NewNum(Convert.ToString(s.row.escortStage)));
+        if (s.row.escortStage == 1) {
+            long left = s.row.escortUntil - now;
+            if (left < 0) { left = 0; }
+            a.Set("left", JsonValue.NewNum(Convert.ToString(left)));
+            a.Set("reward", JsonValue.NewNum(Convert.ToString(s.row.escortReward)));
+        }
+        return a;
+    }
+
+    /* guild: {}=列表+我的会；{"create":"名"}=建会（1000金币）；
+       {"join":id}=入会；{"quit":1}=退会。会长退会先转让/拒绝。 */
+    static async JsonValue Guild(Session s, JsonValue m, long now) {
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            if (m.Str("create", "").Length > 0) {
+                string name = m.Str("create", "").Trim();
+                if (Fmt.CharCount(name) < 2 || Fmt.CharCount(name) > 12) {
+                    return Gateway.Err("行会名需 2-12 字");
+                }
+                if (s.row.guildId > 0) { return Gateway.Err("你已有行会，先退出再建"); }
+                if (s.row.gold < 1000) { return Gateway.Err("建会需要 1000 金币"); }
+                int dup = await db.Select<ZanWeb.Model.Game.Guild>()
+                    .Where(a => a.name == name).CountAsync();
+                if (dup > 0) { return Gateway.Err("行会名已被使用"); }
+                s.row.gold = s.row.gold - 1000;
+                ZanWeb.Model.Game.Guild g = new ZanWeb.Model.Game.Guild();
+                g.name = name;
+                g.leader = s.row.nickname;
+                g.fund = 0;
+                g.createdAt = now;
+                int gid = await db.Insert<ZanWeb.Model.Game.Guild>(g)
+                    .ExecuteIdentityAsync();
+                s.row.guildId = gid;
+                s.dirty = true;
+            }
+            if (m.Int("join", 0) > 0) {
+                if (s.row.guildId > 0) { return Gateway.Err("你已在行会中"); }
+                ZanWeb.Model.Game.Guild g = await db
+                    .Select<ZanWeb.Model.Game.Guild>()
+                    .Where(a => a.id == m.Int("join", 0)).FirstAsync();
+                if (g == null) { return Gateway.Err("没有这个行会"); }
+                s.row.guildId = g.id;
+                s.dirty = true;
+            }
+            if (m.Int("quit", 0) == 1) {
+                if (s.row.guildId <= 0) { return Gateway.Err("你还没有行会"); }
+                ZanWeb.Model.Game.Guild g = await db
+                    .Select<ZanWeb.Model.Game.Guild>()
+                    .Where(a => a.id == s.row.guildId).FirstAsync();
+                if (g != null && g.leader == s.row.nickname) {
+                    int members = await db.Select<ZanWeb.Model.Game.Player>()
+                        .Where(a => a.guildId == g.id).CountAsync();
+                    if (members > 1) {
+                        return Gateway.Err("会长不能直接退会，请先转让或解散");
+                    }
+                    await db.Delete<ZanWeb.Model.Game.Guild>()
+                        .Where(a => a.id == g.id).ExecuteAffrowsAsync();
+                }
+                s.row.guildId = 0;
+                s.dirty = true;
+            }
+            List<ZanWeb.Model.Game.Guild> rows = await db
+                .Select<ZanWeb.Model.Game.Guild>()
+                .OrderBy(a => a.id).ToListAsync();
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                ZanWeb.Model.Game.Guild g = rows[i];
+                int members = await db.Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.guildId == g.id).CountAsync();
+                JsonValue o = JsonValue.NewObject();
+                o.Set("id", JsonValue.NewNum(Convert.ToString(g.id)));
+                o.Set("name", JsonValue.NewStr(g.name));
+                o.Set("leader", JsonValue.NewStr(g.leader));
+                o.Set("fund", JsonValue.NewNum(Convert.ToString(g.fund)));
+                o.Set("members", JsonValue.NewNum(Convert.ToString(members)));
+                o.Set("mine", JsonValue.NewNum(g.id == s.row.guildId ? "1" : "0"));
+                arr.Append(o);
+            }
+            JsonValue r = Gateway.Ok();
+            r.Set("rows", arr);
+            r.Set("myGuild", JsonValue.NewNum(Convert.ToString(s.row.guildId)));
+            Gateway.SelfInto(r, s);
+            return r;
+        } finally {
+            Gateway.Give(db);
+        }
+    }
+
+    /* siege 城池争夺：沙巴克城主（owner 名 + 申报战时间，进程内记忆）
+       + 城池争夺页的 8 座钱庄（每座 owner/guild/at，进程内记忆，重启
+       清空，同 redpack 定式）。攻占 = 消耗 2000 金币掷骰（胜率
+       40%+战力/10），成功即易主并全服公告。 */
+    static string siegeOwner = "";
+    static string siegeGuild = "";
+    static long siegeAt = 0;
+    static string[] cityOwners = new string[] { "", "", "", "", "", "", "", "" };
+    static string[] cityGuilds = new string[] { "", "", "", "", "", "", "", "" };
+    static long[] cityAt = new long[] { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    static string CityName(int city) { return "钱庄" + Convert.ToString(city); }
+
+    static async JsonValue Siege(Session s, JsonValue m, long now) {
+        if (m.Int("attack", 0) == 1) {
+            int city = m.Int("city", 0);
+            if (city < 1 || city > 8) { return Gateway.Err("城池编号不合法"); }
+            if (s.row.guildId <= 0) { return Gateway.Err("先加入行会才能攻占城池"); }
+            if (s.row.gold < 2000) { return Gateway.Err("攻占城池需要 2000 金币"); }
+            string guildName = "";
+            IDbConnection db = await Gateway.Db();
+            if (db != null) {
+                try {
+                    ZanWeb.Model.Game.Guild g = await db
+                        .Select<ZanWeb.Model.Game.Guild>()
+                        .Where(a => a.id == s.row.guildId).FirstAsync();
+                    if (g != null) { guildName = g.name; }
+                } finally {
+                    Gateway.Give(db);
+                }
+            }
+            int power = Fight.Atk(s.row) + s.row.level * 2;
+            s.row.gold = s.row.gold - 2000;
+            s.dirty = true;
+            bool win = Play.rng.Between(0, 100) < 40 + power / 10;
+            JsonValue r = Gateway.Ok();
+            if (win) {
+                Play.cityOwners[city - 1] = s.row.nickname;
+                Play.cityGuilds[city - 1] = guildName;
+                Play.cityAt[city - 1] = now;
+                Gateway.AnnounceAll("城池易主",
+                    s.row.nickname + " 率行会攻占了" + Play.CityName(city) + "！");
+            }
+            r.Set("win", JsonValue.NewNum(win ? "1" : "0"));
+            r.Set("log", JsonValue.NewStr(win
+                ? "攻占" + Play.CityName(city) + "成功，全服公告已发！"
+                : "攻占" + Play.CityName(city) + "失败，守军太强。金币已消耗。"));
+            r.Set("siege", Play.SiegeState(now));
+            Gateway.SelfInto(r, s);
+            return r;
+        }
+        JsonValue r2 = Gateway.Ok();
+        r2.Set("siege", Play.SiegeState(now));
+        return r2;
+    }
+
+    static JsonValue SiegeState(long now) {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("owner", JsonValue.NewStr(Play.siegeOwner));
+        o.Set("guild", JsonValue.NewStr(Play.siegeGuild));
+        long hold = Play.siegeAt > 0 ? now - Play.siegeAt : 0;
+        o.Set("holdSeconds", JsonValue.NewNum(Convert.ToString(hold)));
+        /* 城池争夺页的 8 座钱庄：date 直接下发 yyyy-MM-dd（占领日），
+           income 为每小时产出金币（占领展示数值）。 */
+        JsonValue cities = JsonValue.NewArray();
+        for (int i = 0; i < 8; i = i + 1) {
+            JsonValue c = JsonValue.NewObject();
+            c.Set("id", JsonValue.NewNum(Convert.ToString(i + 1)));
+            c.Set("name", JsonValue.NewStr("钱庄" + Convert.ToString(i + 1)));
+            c.Set("owner", JsonValue.NewStr(Play.cityOwners[i]));
+            c.Set("guild", JsonValue.NewStr(Play.cityGuilds[i]));
+            c.Set("income", JsonValue.NewNum(Convert.ToString(500 + i * 250)));
+            c.Set("date", JsonValue.NewStr(Play.cityAt[i] > 0
+                ? Play.Today(Play.cityAt[i]) : ""));
+            cities.Append(c);
+        }
+        o.Set("cities", cities);
+        return o;
+    }
+
+    /* tower 传说塔：{"climb":1} 爬一层。敌人强度随层涨，胜利楼层+1、
+       经验金币入账；失败塔层保留（明日再战），每日 10 次尝试（原版
+       挑战次数 10/10）。 */
+    static JsonValue Tower(Session s, JsonValue m, long now) {
+        Play.DailyReset(s, now);
+        if (m.Int("climb", 0) == 1) {
+            if (s.row.towerTries <= 0) {
+                return Gateway.Err("今日登塔次数已用完，明天再来");
+            }
+            s.row.towerTries = s.row.towerTries - 1;
+            int floor = s.row.towerFloor + 1;
+            int foeAtk = 30 + floor * 12;
+            int foeHp = 200 + floor * 150;
+            int myAtk = Fight.Atk(s.row);
+            int myDef = Fight.Def(s.row);
+            bool win = myAtk * 10 > foeAtk * (4 + floor / 5)
+                && myAtk * (foeHp / (myAtk > 0 ? myAtk : 1)) > 0;
+            JsonValue r = Gateway.Ok();
+            if (win) {
+                s.row.towerFloor = floor;
+                long gold = 100 + (long)floor * 60;
+                long exp = 60 + (long)floor * 45;
+                s.row.gold = s.row.gold + gold;
+                s.row.exp = s.row.exp + exp;
+                int ups = 0;
+                while (s.row.exp >= Fight.ExpNext(s.row.level)) {
+                    s.row.exp = s.row.exp - Fight.ExpNext(s.row.level);
+                    s.row.level = s.row.level + 1;
+                    s.row.hp = Fight.MaxHp(s.row);
+                    s.row.mp = Fight.MaxMp(s.row);
+                    ups = ups + 1;
+                }
+                r.Set("levelup", JsonValue.NewNum(Convert.ToString(ups > 0
+                    ? s.row.level : 0)));
+                r.Set("gold", JsonValue.NewNum(Convert.ToString(gold)));
+                r.Set("exp", JsonValue.NewNum(Convert.ToString(exp)));
+                r.Set("floor", JsonValue.NewNum(Convert.ToString(floor)));
+            }
+            r.Set("win", JsonValue.NewNum(win ? "1" : "0"));
+            r.Set("log", JsonValue.NewStr(win
+                ? "第 " + Convert.ToString(floor) + " 层攻克！"
+                : "第 " + Convert.ToString(floor) + " 层守卫太强， Retreat。"));
+            r.Set("tower", Play.TowerState(s));
+            Gateway.SelfInto(r, s);
+            s.dirty = true;
+            return r;
+        }
+        JsonValue r2 = Gateway.Ok();
+        r2.Set("tower", Play.TowerState(s));
+        return r2;
+    }
+
+    static JsonValue TowerState(Session s) {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("floor", JsonValue.NewNum(Convert.ToString(s.row.towerFloor)));
+        o.Set("tries", JsonValue.NewNum(Convert.ToString(s.row.towerTries)));
+        o.Set("maxTries", JsonValue.NewNum(Convert.ToString(TOWER_MAX_TRIES)));
+        /* 传说塔页的挑战者卡（原版每层 15 张）：本区前 15 名的层榜，
+           rank 0 = 自己的位置卡（floor=自己进度，me=1）。 */
+        o.Set("rivals", Play.TowerRivals(s));
+        return o;
+    }
+
+    /* 挑战者：本区层榜前 15（level/kills 排序近似），不含自己。 */
+    static async JsonValue TowerRivals(Session s) {
+        JsonValue arr = JsonValue.NewArray();
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return arr; }
+        try {
+            List<ZanWeb.Model.Game.Player> rows = await db
+                .Select<ZanWeb.Model.Game.Player>()
+                .Where(a => a.realmId == s.realmId && a.id != s.row.id)
+                .OrderByDescending(a => a.towerFloor)
+                .ToListAsync();
+            for (int i = 0; i < rows.Count && i < 15; i = i + 1) {
+                JsonValue p = JsonValue.NewObject();
+                p.Set("name", JsonValue.NewStr(rows[i].nickname));
+                p.Set("floor", JsonValue.NewNum(Convert.ToString(rows[i].towerFloor)));
+                p.Set("level", JsonValue.NewNum(Convert.ToString(rows[i].level)));
+                arr.Append(p);
+            }
+        } finally {
+            Gateway.Give(db);
+        }
+        return arr;
+    }
+
+    /* wuxing 五行修炼：{"do":"pool"} 打怪经验入池（挂机自动）；
+       {"do":"inject","id":0..4} 注入；{"do":"up","id":0..4} 突破。 */
+    static JsonValue Wuxing(Session s, JsonValue m) {
+        int[] ranks = Play.WxParse(s.row.wuxingRanks);
+        long[] xp = Play.WxParseL(s.row.wuxingXp);
+        string act = m.Str("do", "");
+        JsonValue r = Gateway.Ok();
+        if (act == "inject") {
+            int id = m.Int("id", -1);
+            if (id < 0 || id > 4) { return Gateway.Err("五行编号不合法"); }
+            if (ranks[id] >= WX_MAX) { return Gateway.Err("该五行已满级"); }
+            long need = (long)WX_XP_BASE + WX_XP_STEP * ranks[id];
+            long amount = need - xp[id];
+            if (amount > s.row.wuxingPool) { amount = s.row.wuxingPool; }
+            if (amount <= 0) { return Gateway.Err("经验池为空，先去挂机积累"); }
+            s.row.wuxingPool = s.row.wuxingPool - amount;
+            xp[id] = xp[id] + amount;
+            s.dirty = true;
+        } else if (act == "up") {
+            int id = m.Int("id", -1);
+            if (id < 0 || id > 4) { return Gateway.Err("五行编号不合法"); }
+            if (ranks[id] >= WX_MAX) { return Gateway.Err("该五行已满级"); }
+            long need = (long)WX_XP_BASE + WX_XP_STEP * ranks[id];
+            if (xp[id] < need) { return Gateway.Err("经验不足，先注入"); }
+            long cost = 800 + (long)ranks[id] * 400;
+            long yuanCost = ranks[id] / 2;
+            if (s.row.gold < cost) {
+                return Gateway.Err("突破需要 " + Convert.ToString(cost) + " 金币");
+            }
+            if (s.row.gems < yuanCost) {
+                return Gateway.Err("突破需要 " + Convert.ToString(yuanCost) + " 元宝");
+            }
+            s.row.gold = s.row.gold - cost;
+            s.row.gems = s.row.gems - yuanCost;
+            xp[id] = xp[id] - need;
+            ranks[id] = ranks[id] + 1;
+            s.row.wuxing = ranks[0] + ranks[1] + ranks[2] + ranks[3] + ranks[4];
+            s.dirty = true;
+        }
+        s.row.wuxingRanks = Play.WxJoin(ranks);
+        s.row.wuxingXp = Play.WxJoinL(xp);
+        r.Set("wuxing", Play.WuxingState(s, ranks, xp));
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* 打怪入池：Fight.OnKill 每击 +1（Play.WxGain）。 */
+    static void WxGain(Session s) {
+        if (s.row.wuxingPool < WX_POOL_CAP) { s.row.wuxingPool = s.row.wuxingPool + 1; }
+        s.dirty = true;
+    }
+
+    /* 祭坛增益是否生效（Fight.OnKill 结算经验/金币 ×1.1）。 */
+    static bool AltarBuffed(Session s) {
+        return s.row.altarBuffUntil > WebApp.NowSeconds();
+    }
+
+    static int[] WxParse(string csv) {
+        int[] v = new int[] { 0, 0, 0, 0, 0 };
+        if (csv == null || csv.Length == 0) { return v; }
+        List<string> parts = csv.Split(',');
+        for (int i = 0; i < 5 && i < parts.Count; i = i + 1) {
+            v[i] = Convert.ToInt(parts[i].Trim());
+        }
+        return v;
+    }
+
+    static long[] WxParseL(string csv) {
+        long[] v = new long[] { 0, 0, 0, 0, 0 };
+        if (csv == null || csv.Length == 0) { return v; }
+        List<string> parts = csv.Split(',');
+        for (int i = 0; i < 5 && i < parts.Count; i = i + 1) {
+            v[i] = Convert.ToInt64(parts[i].Trim());
+        }
+        return v;
+    }
+
+    static string WxJoin(int[] v) {
+        string t = "";
+        for (int i = 0; i < 5; i = i + 1) {
+            t = t + (i > 0 ? "," : "") + Convert.ToString(v[i]);
+        }
+        return t;
+    }
+
+    static string WxJoinL(long[] v) {
+        string t = "";
+        for (int i = 0; i < 5; i = i + 1) {
+            t = t + (i > 0 ? "," : "") + Convert.ToString(v[i]);
+        }
+        return t;
+    }
+
+    static JsonValue WuxingState(Session s, int[] ranks, long[] xp) {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("pool", JsonValue.NewNum(Convert.ToString(s.row.wuxingPool)));
+        o.Set("poolCap", JsonValue.NewNum(Convert.ToString(WX_POOL_CAP)));
+        JsonValue arr = JsonValue.NewArray();
+        string[] names = new string[] { "金", "木", "水", "火", "土" };
+        for (int i = 0; i < 5; i = i + 1) {
+            JsonValue e = JsonValue.NewObject();
+            e.Set("id", JsonValue.NewNum(Convert.ToString(i)));
+            e.Set("name", JsonValue.NewStr(names[i]));
+            e.Set("rank", JsonValue.NewNum(Convert.ToString(ranks[i])));
+            e.Set("xp", JsonValue.NewNum(Convert.ToString(xp[i])));
+            e.Set("need", JsonValue.NewNum(Convert.ToString(
+                WX_XP_BASE + WX_XP_STEP * ranks[i])));
+            arr.Append(e);
+        }
+        o.Set("rows", arr);
+        return o;
+    }
+
+    /* mentor 师徒：{"master":"名"}=拜师；{"take":1}=出师（等级≥30 且
+       有师父）。徒弟列表见师傅视角：本进程内按 masterName 反查。 */
+    static async JsonValue Mentor(Session s, JsonValue m, long now) {
+        /* masterName 老库可能为 NULL（SelfJson 同款判空）：Length 直探
+           会打崩整个 op，先归一成空串再走业务。 */
+        if (s.row.masterName == null) { s.row.masterName = ""; }
+        if (m.Str("master", "").Length > 0) {
+            string name = m.Str("master", "").Trim();
+            if (s.row.masterName.Length > 0) {
+                return Gateway.Err("你已有师父：" + s.row.masterName);
+            }
+            if (name == s.row.nickname) { return Gateway.Err("不能拜自己为师"); }
+            IDbConnection db = await Gateway.Db();
+            if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+            try {
+                ZanWeb.Model.Game.Player master = await db
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.nickname == name && a.realmId == s.realmId)
+                    .FirstAsync();
+                if (master == null) { return Gateway.Err("本区没有这位玩家"); }
+                if (master.level <= s.row.level) {
+                    return Gateway.Err("对方等级不比你高，不能拜师");
+                }
+                s.row.masterName = name;
+                s.dirty = true;
+            } finally {
+                Gateway.Give(db);
+            }
+        }
+        if (m.Int("take", 0) == 1) {
+            if (s.row.masterName.Length == 0) { return Gateway.Err("你还没有师父"); }
+            if (s.row.level < 30) { return Gateway.Err("出师需 30 级"); }
+            s.row.masterName = "";
+            s.row.gold = s.row.gold + 2000;
+            s.row.exp = s.row.exp + 3000;
+            s.dirty = true;
+        }
+        JsonValue r = Gateway.Ok();
+        JsonValue o = JsonValue.NewObject();
+        o.Set("master", JsonValue.NewStr(s.row.masterName));
+        o.Set("canTake", JsonValue.NewNum(
+            s.row.masterName.Length > 0 && s.row.level >= 30 ? "1" : "0"));
+        r.Set("mentor", o);
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* altar 祭坛：{"do":"gold"|"yuan"|"large"|"iron"} 捐献；
+       {"do":"claim"} 领个人奖励。捐献+Buff 到期前打怪 ×1.1。 */
+    static JsonValue Altar(Session s, JsonValue m, long now) {
+        Play.DailyReset(s, now);
+        string act = m.Str("do", "");
+        if (act.Length > 0 && act != "claim") {
+            long points = 0;
+            if (act == "gold") {
+                if (s.row.gold < ALTAR_GOLD_COST) { return Gateway.Err("金币不够"); }
+                s.row.gold = s.row.gold - ALTAR_GOLD_COST;
+                points = ALTAR_GOLD_GAIN;
+            } else if (act == "yuan") {
+                if (s.row.gems < ALTAR_YUAN_COST) { return Gateway.Err("元宝不够"); }
+                s.row.gems = s.row.gems - ALTAR_YUAN_COST;
+                points = ALTAR_YUAN_GAIN;
+            } else if (act == "large") {
+                if (s.row.gems < ALTAR_YUAN_LARGE_COST) { return Gateway.Err("元宝不够"); }
+                s.row.gems = s.row.gems - ALTAR_YUAN_LARGE_COST;
+                points = ALTAR_YUAN_LARGE_GAIN;
+            } else if (act == "iron") {
+                ZanWeb.Model.Game.Item iron = Fight.ByName("黑铁矿石");
+                if (iron == null) { return Gateway.Err("黑铁矿石不存在"); }
+                if (!Fight.BagTake(s, iron.id, ALTAR_IRON_COST)) {
+                    return Gateway.Err("背包里没有 " + Convert.ToString(ALTAR_IRON_COST) + " 个黑铁矿石");
+                }
+                points = ALTAR_IRON_GAIN;
+            } else {
+                return Gateway.Err("未知捐献类型");
+            }
+            s.row.altarPersonal = s.row.altarPersonal + points;
+            s.row.altarDonations = s.row.altarDonations + 1;
+            s.row.altarBuffUntil = now + ALTAR_BUFF_SECONDS;
+            s.dirty = true;
+        }
+        if (act == "claim") {
+            if (s.row.altarPersonal < ALTAR_PERSONAL_CAP) {
+                return Gateway.Err("个人进度未到领取线（"
+                    + Convert.ToString(ALTAR_PERSONAL_CAP) + "）");
+            }
+            s.row.altarPersonal = s.row.altarPersonal - ALTAR_PERSONAL_CAP;
+            s.row.gold = s.row.gold + ALTAR_PERSONAL_REWARD_GOLD;
+            s.row.gems = s.row.gems + ALTAR_PERSONAL_REWARD_YUAN;
+            s.dirty = true;
+        }
+        JsonValue r = Gateway.Ok();
+        JsonValue o = JsonValue.NewObject();
+        o.Set("personal", JsonValue.NewNum(Convert.ToString(s.row.altarPersonal)));
+        o.Set("cap", JsonValue.NewNum(Convert.ToString(ALTAR_PERSONAL_CAP)));
+        o.Set("donations", JsonValue.NewNum(Convert.ToString(s.row.altarDonations)));
+        long buffLeft = s.row.altarBuffUntil - now;
+        o.Set("buff", JsonValue.NewNum(Convert.ToString(buffLeft > 0 ? buffLeft : 0)));
+        r.Set("altar", o);
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* stars 将星图谱：全 BOSS 清单（bosses 同源），带点亮状态（该图
+       BOSS 已被本角色击败过，BossFight 胜利时点亮）。 */
+    static JsonValue Stars(Session s, long now) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < Fight.mobs.Count; i = i + 1) {
+            ZanWeb.Model.Game.Mob t = Fight.mobs[i];
+            if (t == null || t.count != 1 || t.status != 1) { continue; }
+            int bit = 1 << (t.mapId - 1);
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(t.name));
+            o.Set("level", JsonValue.NewNum(Convert.ToString(t.level)));
+            o.Set("map", JsonValue.NewNum(Convert.ToString(t.mapId)));
+            o.Set("lit", JsonValue.NewNum((s.row.stars & bit) != 0 ? "1" : "0"));
+            arr.Append(o);
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", arr);
+        return r;
+    }
+
+    /* BossFight 胜利后点亮图谱位（Fight 调用）。 */
+    static void LightStar(Session s, int mapId) {
+        int bit = 1 << (mapId - 1);
+        if ((s.row.stars & bit) == 0) {
+            s.row.stars = s.row.stars | bit;
+            s.dirty = true;
+        }
+    }
+
+    /* redpack 发红包：{"gold":N} 发一个全服红包（金币入奖池）；
+       {"grab":1} 抢一次（每红包每人一次）。进程内运营，重启清空。 */
+    static long rpPool = 0;
+    static string rpFrom = "";
+    static List<string> rpTaken = new List<string>();
+
+    static JsonValue Redpack(Session s, JsonValue m, long now) {
+        if (m.Int("send", 0) > 0) {
+            long amount = m.Int("send", 0);
+            if (amount < 100 || amount > 100000) {
+                return Gateway.Err("红包金额需 100-100000 金币");
+            }
+            if (s.row.gold < amount) { return Gateway.Err("金币不够"); }
+            s.row.gold = s.row.gold - amount;
+            Play.rpPool = Play.rpPool + amount;
+            Play.rpFrom = s.row.nickname;
+            Play.rpTaken.Clear();
+            s.dirty = true;
+            Gateway.AnnounceAll("红包雨",
+                s.row.nickname + " 发出 " + Convert.ToString(amount)
+                + " 金币红包，全服可抢！");
+        }
+        JsonValue r = Gateway.Ok();
+        JsonValue o = JsonValue.NewObject();
+        o.Set("pool", JsonValue.NewNum(Convert.ToString(Play.rpPool)));
+        o.Set("from", JsonValue.NewStr(Play.rpFrom));
+        if (m.Int("grab", 0) == 1) {
+            if (Play.rpPool <= 0) { return Gateway.Err("红包已抢完"); }
+            for (int i = 0; i < Play.rpTaken.Count; i = i + 1) {
+                if (Play.rpTaken[i] == s.row.nickname) {
+                    return Gateway.Err("你已经抢过这个红包了");
+                }
+            }
+            long grab = Play.rpPool / 2;
+            if (grab < 1) { grab = Play.rpPool; }
+            if (grab > Play.rpPool) { grab = Play.rpPool; }
+            Play.rpPool = Play.rpPool - grab;
+            Play.rpTaken.Add(s.row.nickname);
+            s.row.gold = s.row.gold + grab;
+            s.dirty = true;
+            o.Set("grab", JsonValue.NewNum(Convert.ToString(grab)));
+        }
+        o.Set("taken", JsonValue.NewNum(Play.rpTaken.IndexOf(s.row.nickname) >= 0
+            ? "1" : "0"));
+        r.Set("redpack", o);
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* market 交易市场：{}=列表；{"sellItem":id,"count":N,"price":P}=上架；
+       {"buy":rowId}=购买；{"cancel":rowId}=下架。 */
+    static async JsonValue Market(Session s, JsonValue m) {
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            if (m.Int("sellItem", 0) > 0) {
+                int itemId = m.Int("sellItem", 0);
+                int count = m.Int("count", 1);
+                long price = m.Int("price", 0);
+                if (count < 1) { count = 1; }
+                if (price < 1) { return Gateway.Err("价格需大于 0"); }
+                if (!Fight.BagTake(s, itemId, count)) {
+                    return Gateway.Err("背包里数量不够");
+                }
+                ZanWeb.Model.Game.Item it = Fight.ById(itemId);
+                ZanWeb.Model.Game.Market row = new ZanWeb.Model.Game.Market();
+                row.sellerId = s.row.id;
+                row.sellerName = s.row.nickname;
+                row.itemId = itemId;
+                row.count = count;
+                row.price = price;
+                row.createdAt = WebApp.NowSeconds();
+                int _id = await db.Insert<ZanWeb.Model.Game.Market>(row)
+                    .ExecuteIdentityAsync();
+                s.dirty = true;
+            }
+            if (m.Int("buy", 0) > 0) {
+                ZanWeb.Model.Game.Market row = await db
+                    .Select<ZanWeb.Model.Game.Market>()
+                    .Where(a => a.id == m.Int("buy", 0)).FirstAsync();
+                if (row == null) { return Gateway.Err("这件商品已售出或下架"); }
+                if (row.sellerId == s.row.id) { return Gateway.Err("不能买自己的挂单"); }
+                if (s.row.gold < row.price) { return Gateway.Err("金币不够"); }
+                s.row.gold = s.row.gold - row.price;
+                Fight.BagAdd(s, row.itemId, row.count);
+                s.dirty = true;
+                /* 卖家离线也成立：金币直接记他角色行。 */
+                ZanWeb.Model.Game.Player seller = await db
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.id == row.sellerId).FirstAsync();
+                if (seller != null) {
+                    Session online = World.ByChar(seller.id);
+                    if (online != null) {
+                        online.row.gold = online.row.gold + row.price;
+                        online.dirty = true;
+                    } else {
+                        seller.gold = seller.gold + row.price;
+                        int _u = await db.Update<ZanWeb.Model.Game.Player>()
+                            .Set(a => a.gold, seller.gold)
+                            .Where(a => a.id == seller.id).ExecuteAffrowsAsync();
+                    }
+                }
+                await db.Delete<ZanWeb.Model.Game.Market>()
+                    .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            }
+            if (m.Int("cancel", 0) > 0) {
+                ZanWeb.Model.Game.Market row = await db
+                    .Select<ZanWeb.Model.Game.Market>()
+                    .Where(a => a.id == m.Int("cancel", 0)).FirstAsync();
+                if (row == null || row.sellerId != s.row.id) {
+                    return Gateway.Err("只能下架自己的挂单");
+                }
+                Fight.BagAdd(s, row.itemId, row.count);
+                s.dirty = true;
+                await db.Delete<ZanWeb.Model.Game.Market>()
+                    .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            }
+            List<ZanWeb.Model.Game.Market> rows = await db
+                .Select<ZanWeb.Model.Game.Market>()
+                .OrderBy(a => a.id).ToListAsync();
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                ZanWeb.Model.Game.Market row = rows[i];
+                ZanWeb.Model.Game.Item it = Fight.ById(row.itemId);
+                JsonValue o = JsonValue.NewObject();
+                o.Set("id", JsonValue.NewNum(Convert.ToString(row.id)));
+                o.Set("seller", JsonValue.NewStr(row.sellerName));
+                o.Set("name", JsonValue.NewStr(it != null ? it.name : "???"));
+                o.Set("count", JsonValue.NewNum(Convert.ToString(row.count)));
+                o.Set("price", JsonValue.NewNum(Convert.ToString(row.price)));
+                o.Set("mine", JsonValue.NewNum(row.sellerId == s.row.id ? "1" : "0"));
+                arr.Append(o);
+            }
+            JsonValue r = Gateway.Ok();
+            r.Set("rows", arr);
+            Gateway.SelfInto(r, s);
+            return r;
+        } finally {
+            Gateway.Give(db);
+        }
+    }
+
+    /* codex 图鉴明细：kind=items/mobs，page 从 0。 */
+    static JsonValue CodexPage(JsonValue m) {
+        string kind = m.Str("kind", "items");
+        int page = m.Int("page", 0);
+        if (page < 0) { page = 0; }
+        int per = 20;
+        JsonValue arr = JsonValue.NewArray();
+        if (kind == "mobs") {
+            int total = Fight.mobs.Count;
+            int from = page * per;
+            for (int i = from; i < total && i < from + per; i = i + 1) {
+                ZanWeb.Model.Game.Mob t = Fight.mobs[i];
+                JsonValue o = JsonValue.NewObject();
+                o.Set("name", JsonValue.NewStr(t.name));
+                o.Set("level", JsonValue.NewNum(Convert.ToString(t.level)));
+                o.Set("hp", JsonValue.NewNum(Convert.ToString(t.hp)));
+                o.Set("atk", JsonValue.NewNum(Convert.ToString(t.atk)));
+                o.Set("def", JsonValue.NewNum(Convert.ToString(t.def)));
+                o.Set("map", JsonValue.NewNum(Convert.ToString(t.mapId)));
+                o.Set("boss", JsonValue.NewNum(t.count == 1 ? "1" : "0"));
+                o.Set("exp", JsonValue.NewNum(Convert.ToString(t.exp)));
+                arr.Append(o);
+            }
+            JsonValue r = Gateway.Ok();
+            r.Set("rows", arr);
+            r.Set("total", JsonValue.NewNum(Convert.ToString(total)));
+            r.Set("page", JsonValue.NewNum(Convert.ToString(page)));
+            return r;
+        }
+        int total2 = Fight.items.Count;
+        int from2 = page * per;
+        for (int i = from2; i < total2 && i < from2 + per; i = i + 1) {
+            ZanWeb.Model.Game.Item it = Fight.items[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(it.name));
+            o.Set("kind", JsonValue.NewNum(Convert.ToString(it.kind)));
+            o.Set("slot", JsonValue.NewNum(Convert.ToString(it.slot)));
+            o.Set("atk", JsonValue.NewNum(Convert.ToString(it.atk)));
+            o.Set("def", JsonValue.NewNum(Convert.ToString(it.def)));
+            o.Set("heal", JsonValue.NewNum(Convert.ToString(it.hp)));
+            o.Set("price", JsonValue.NewNum(Convert.ToString(it.price)));
+            o.Set("minLevel", JsonValue.NewNum(Convert.ToString(it.minLevel)));
+            o.Set("picture", JsonValue.NewNum(Convert.ToString(it.picture)));
+            arr.Append(o);
+        }
+        JsonValue r2 = Gateway.Ok();
+        r2.Set("rows", arr);
+        r2.Set("total", JsonValue.NewNum(Convert.ToString(total2)));
+        r2.Set("page", JsonValue.NewNum(Convert.ToString(page)));
+        return r2;
+    }
+
+    /* title 称谓：{}=面板（当前称谓+已解锁+可解锁清单）；
+       {"unlock":"名"}=花声望解锁；{"wear":"名"}=佩戴。 */
+    static JsonValue Title(Session s, JsonValue m) {
+        string[] names = new string[] { "初出茅庐", "小有名气", "名震一方", "威震天下", "传奇战神" };
+        int[] need = new int[] { 0, 100, 500, 2000, 10000 };
+        if (m.Str("unlock", "").Length > 0) {
+            string want = m.Str("unlock", "").Trim();
+            int at = -1;
+            for (int i = 0; i < names.Length; i = i + 1) {
+                if (names[i] == want) { at = i; break; }
+            }
+            if (at < 0) { return Gateway.Err("没有这个称谓"); }
+            List<string> owned = Play.TitleList(s.row.titlesUnlocked);
+            if (!owned.Contains(want)) {
+                int pts = need[at] * 10;
+                if (s.row.arenaPts < pts) {
+                    return Gateway.Err("战功不够（需 " + Convert.ToString(pts) + "）");
+                }
+                s.row.arenaPts = s.row.arenaPts - pts;
+                owned.Add(want);
+                s.row.titlesUnlocked = Play.TitleJoin(owned);
+                s.dirty = true;
+            }
+        }
+        if (m.Str("wear", "").Length > 0) {
+            string want = m.Str("wear", "").Trim();
+            if (want == "无") { want = ""; }
+            if (want.Length > 0) {
+                List<string> owned = Play.TitleList(s.row.titlesUnlocked);
+                if (!owned.Contains(want)) { return Gateway.Err("先解锁这个称谓"); }
+            }
+            s.row.title = want;
+            s.dirty = true;
+        }
+        List<string> mine = Play.TitleList(s.row.titlesUnlocked);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < names.Length; i = i + 1) {
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(names[i]));
+            o.Set("cost", JsonValue.NewNum(Convert.ToString(need[i] * 10)));
+            o.Set("owned", JsonValue.NewNum(mine.Contains(names[i]) ? "1" : "0"));
+            o.Set("worn", JsonValue.NewNum(s.row.title == names[i] ? "1" : "0"));
+            arr.Append(o);
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", arr);
+        r.Set("pts", JsonValue.NewNum(Convert.ToString(s.row.arenaPts)));
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    static List<string> TitleList(string csv) {
+        List<string> v = new List<string>();
+        if (csv == null || csv.Length == 0) { return v; }
+        List<string> parts = csv.Split(',');
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string t = parts[i].Trim();
+            if (t.Length > 0) { v.Add(t); }
+        }
+        return v;
+    }
+
+    static string TitleJoin(List<string> v) {
+        string t = "";
+        for (int i = 0; i < v.Count; i = i + 1) {
+            t = t + (i > 0 ? "," : "") + v[i];
+        }
+        return t;
+    }
+}

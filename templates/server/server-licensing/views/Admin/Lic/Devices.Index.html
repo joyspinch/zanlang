@@ -1,0 +1,71 @@
+<div class="card">
+  <h3>5 分钟内在线座位（会话随心跳自动续期）</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th style="width:180px">授权主体</th>
+        <th>设备指纹</th>
+        <th style="width:150px">最后心跳</th>
+        <th style="width:100px">距今</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each seats}}
+      <tr>
+        <td>{{subject}}</td>
+        <td class="mono">{{deviceFp}}</td>
+        <td class="muted">{{lastSeen}}</td>
+        <td>{{ago}}</td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if noSeats}}<div class="empty">当前没有在线终端</div>{{/if}}
+</div>
+
+<div class="card">
+  <form class="toolbar" data-search action="/admin/lic/devices">
+    <input class="input w160" type="search" name="kw" value="{{kw}}" placeholder="搜索设备指纹 / 主体">
+    <select class="input w140" name="product">
+      <option value="0">全部产品</option>
+      {{#each products}}<option value="{{id}}" {{selected}}>{{name}}</option>{{/each}}
+    </select>
+    <button class="btn sm" type="submit">查询</button>
+    <a class="btn sm" href="/admin/lic/devices" data-load>重置</a>
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th class="num" style="width:56px">ID</th>
+        <th style="width:130px">产品</th>
+        <th style="width:150px">授权主体</th>
+        <th>设备指纹</th>
+        <th style="width:90px">方式</th>
+        <th style="width:150px">激活时间</th>
+        <th class="ops">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each rows}}
+      <tr>
+        <td class="num muted">{{id}}</td>
+        <td>{{productName}}</td>
+        <td>{{subject}}</td>
+        <td class="mono">{{deviceFp}}</td>
+        <td>{{modeText}}</td>
+        <td class="muted">{{createdAt}}</td>
+        <td class="ops">
+          {{#if canUpdate}}<a href="#" data-post="/admin/lic/devices/unbind" data-args="id={{id}}" data-confirm="解绑后该设备需要重新激活，确定吗？">解绑</a>{{/if}}
+        </td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+  {{#if empty}}<div class="empty">还没有绑定设备</div>{{/if}}
+  <div class="pager">
+    <span>共 {{total}} 条 · 第 {{page}}/{{pages}} 页</span>
+    <span class="sp"></span>
+    {{#if prev}}<a class="btn sm" href="?page={{prev}}&kw={{kw}}&product={{product}}" data-load>上一页</a>{{/if}}
+    {{#if next}}<a class="btn sm" href="?page={{next}}&kw={{kw}}&product={{product}}" data-load>下一页</a>{{/if}}
+  </div>
+</div>

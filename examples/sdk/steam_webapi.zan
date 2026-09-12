@@ -1,0 +1,239 @@
+// ============================================================================
+// Steam Web API SDK —— 离线自测探针 + 可选真网 smoke
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. 内置"假 Steam 网关"（HttpServer 回放官方响应形态），闭环跑通
+//      SDK 的全部 6 个封装接口与错误路径——不装 Steam、没有 key 也能验；
+//   2. 命令行带 <webApiKey> <appId> 时额外访问正式网关
+//      api.steampowered.com 做 smoke（GetNumberOfCurrentPlayers，无需 key
+//      的公开接口 + 需要 key 的玩家资料查询）。
+//
+// 运行：
+//   build/zanc.exe examples/sdk/steam_webapi.zan --auto-stdlib -o build/steam_webapi.exe
+//   build/steam_webapi.exe                     # 离线自测
+//   build/steam_webapi.exe <webApiKey> <appId> # 离线自测 + 真网 smoke
+// ============================================================================
+using System;
+using System.Json;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.Http;
+using Sdk.Steam;
+
+class Program {
+    static int PORT = 54571;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    // ---- 假 Steam 网关：按官方文档的 JSON 形态回放 -----------------------------
+    // 64 位整数以字符串返回（Steam 约定）、信封各接口不同，都与线上一致。
+    static async HttpResponse FakeSteam(HttpRequest req) {
+        if (req.method == "GET"
+                && req.path == "/ISteamUserStats/GetNumberOfCurrentPlayers/v1") {
+            return HttpResponse.Json("{\"response\":{\"result\":1,"
+                + "\"player_count\":123456}}");
+        }
+        if (req.method == "GET" && req.path == "/ISteamUser/GetPlayerSummaries/v0002") {
+            string ids = req.GetQueryParam("steamids");
+            return HttpResponse.Json("{\"response\":{\"players\":[{"
+                + "\"steamid\":\"" + ids + "\","
+                + "\"personaname\":\"Tester\","
+                + "\"profileurl\":\"https://steamcommunity.com/id/tester/\","
+                + "\"avatar\":\"https://cdn/32.jpg\","
+                + "\"avatarfull\":\"https://cdn/184.jpg\","
+                + "\"personastate\":1,"
+                + "\"communityvisibilitystate\":3,"
+                + "\"lastlogoff\":\"1700000000\","
+                + "\"timecreated\":\"1600000000\","
+                + "\"gameextrainfo\":\"Zan Demo\","
+                + "\"gameid\":\"480\","
+                + "\"loccountrycode\":\"CN\"}]}}");
+        }
+        if (req.method == "POST"
+                && req.path == "/ISteamUserAuth/AuthenticateUserTicket/v1") {
+            string ticket = req.GetFormField("ticket");
+            if (ticket == "badticket") {
+                return HttpResponse.Json("{\"response\":{\"params\":{"
+                    + "\"result\":3,\"steamid\":\"\"}}}");
+            }
+            return HttpResponse.Json("{\"response\":{\"params\":{"
+                + "\"result\":\"OK\",\"steamid\":\"76561197960287930\","
+                + "\"ownersteamid\":\"76561197960287931\","
+                + "\"vacbanned\":false,\"publisherbanned\":false}}}");
+        }
+        if (req.method == "GET" && req.path == "/ISteamUserStats/GetSchemaForGame/v2") {
+            return HttpResponse.Json("{\"game\":{\"gameName\":\"Zan Demo\","
+                + "\"gameVersion\":7,"
+                + "\"availableGameStats\":{\"achievements\":[{"
+                + "\"name\":\"FIRST_BLOOD\",\"defaultvalue\":0,"
+                + "\"displayName\":\"First Blood\",\"hidden\":0,"
+                + "\"description\":\"Win once\","
+                + "\"icon\":\"https://cdn/i.png\",\"icongray\":\"https://cdn/ig.png\"}],"
+                + "\"stats\":[{\"name\":\"kills\",\"defaultvalue\":0,"
+                + "\"displayName\":\"Kills\"}]}}}");
+        }
+        if (req.method == "POST" && req.path == "/ISteamUserStats/SetUserStatsForGame/v1") {
+            // Steam 只回 {"response":{}}；把收到的表单回显在 header 里便于核对。
+            HttpResponse resp = HttpResponse.Json("{\"response\":{}}");
+            resp.SetHeader("X-Echo-Body", req.body.Replace("\r", "").Replace("\n", ""));
+            return resp;
+        }
+        if (req.method == "GET" && req.path == "/IPlayerService/GetOwnedGames/v0001") {
+            return HttpResponse.Json("{\"response\":{\"game_count\":2,\"games\":[{"
+                + "\"appid\":480,\"name\":\"Spacewar\","
+                + "\"playtime_forever\":120,\"playtime_2weeks\":60,"
+                + "\"rtime_last_played\":\"1700000000\"},{"
+                + "\"appid\":440,\"playtime_forever\":5}]}}");
+        }
+        // key 无效时的线上行为：HTTP 403，正文是 XML/HTML 错误页
+        if (req.GetHeader("X-Fake-Forbidden") != null) {
+            return HttpResponse.WithStatus(403, "Forbidden", "Access is denied");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    // ---- 离线闭环：全部接口 + 错误路径 ----------------------------------------
+    static async int OfflineSuite() {
+        Socket.Initialize();
+
+        HttpServer fake = new HttpServer("127.0.0.1", PORT);
+        fake.OnRequest(Program.FakeSteam);
+        Task.Spawn(fake.Start());
+        await Task.Delay(50);
+
+        // AllowLocalHttp：放行 127.0.0.1 的明文 HTTP（ExternalCallPolicy 约定）。
+        // PlainHttpMode：假网关是明文 HttpServer（对明文服务器发 TLS 握手会
+        // 挂死到 30 秒硬截止，见 TlsStream.HandshakeAsync 的超时注释）。
+        SteamClient client = new SteamClient("fake-key", 480);
+        client.Server("127.0.0.1", PORT);
+        client.Timeout(5000);
+        client.PlainHttpMode();
+        client.WithCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp());
+
+        // 1) 在线人数：读 response.player_count
+        SteamResponse r1 = await client.GetNumberOfCurrentPlayersAsync();
+        Check(r1.Int("response.player_count", 0) == 123456, "player count");
+        Check(r1.Int("response.result", 0) == 1, "player count result=1");
+
+        // 2) 玩家资料：便捷结果类 + 64 位字符串 SteamID 原样往返
+        List<string> ids = new List<string>();
+        ids.Add("76561197960287930");
+        List<SteamPlayerSummary> players = await client.GetPlayersAsync(ids);
+        Check(players.Count == 1, "players count");
+        Check(players[0].SteamId == "76561197960287930", "player steamid");
+        Check(players[0].PersonaName == "Tester", "player personaname");
+        Check(players[0].PersonaState == 1, "player personastate");
+        Check(players[0].TimeCreated == 1600000000, "player timecreated");
+        Check(players[0].GameExtraInfo == "Zan Demo", "player gameextrainfo");
+        Check(players[0].GameId == 480, "player gameid");
+        Check(players[0].LocCountryCode == "CN", "player loccountrycode");
+
+        // 3) 票据校验：result=OK -> SteamTicketResult；EResult 3 -> 异常
+        SteamTicketResult ok = await client.AuthenticateUserTicketAsync(
+            "deadbeef", "zan-demo");
+        Check(ok.SteamId == "76561197960287930", "ticket steamid");
+        Check(ok.OwnerSteamId == "76561197960287931", "ticket ownersteamid");
+        Check(!ok.VacBanned && !ok.PublisherBanned, "ticket not banned");
+
+        string badCode = "";
+        try {
+            await client.AuthenticateUserTicketAsync("badticket", "zan-demo");
+        } catch (SteamException e) {
+            badCode = e.Code;
+        }
+        Check(badCode == "auth.3", "ticket reject throws auth.3");
+
+        // 4) 成就 Schema
+        List<SteamAchievement> schema =
+            await client.GetAchievementsSchemaAsync("english");
+        Check(schema.Count == 1, "schema count");
+        Check(schema[0].Name == "FIRST_BLOOD", "schema name");
+        Check(schema[0].DisplayName == "First Blood", "schema displayName");
+        Check(!schema[0].Hidden, "schema hidden=false");
+        Check(schema[0].Icon.Length > 0, "schema icon");
+
+        // 5) 上报成就/统计：表单展开 stats[name]=value
+        JsonValue stats = JsonValue.NewObject();
+        stats.Put("FIRST_BLOOD", JsonValue.NewNum("1"));
+        stats.Put("kills", JsonValue.NewNum("42"));
+        SteamResponse r5 = await client.SetUserStatsForGameAsync(stats, 2);
+        Check(r5.StatusCode == 200, "set stats http 200");
+
+        // 6) 拥有游戏
+        List<SteamOwnedGame> games =
+            await client.GetOwnedGameListAsync("76561197960287930", true, false);
+        Check(games.Count == 2, "owned games count");
+        Check(games[0].Name == "Spacewar", "owned games name");
+        Check(games[0].PlaytimeForeverMinutes == 120, "owned games playtime");
+        Check(games[0].RTimeLastPlayed == 1700000000, "owned games last played");
+        Check(games[1].AppId == 440 && games[1].Name == "", "owned games optional name");
+
+        // 7) 错误路径：参数校验
+        string paramErr = "";
+        try {
+            await client.GetPlayerSummariesAsync(new List<string>());
+        } catch (SteamException e) {
+            paramErr = e.Code;
+        }
+        Check(paramErr == "client.paramError", "param validation");
+
+        fake.Stop();
+        return 0;
+    }
+
+    // ---- 真网 smoke：正式网关上的公开/常规接口 --------------------------------
+    static async int OnlineSmoke(string key, int appId) {
+        SteamClient client = new SteamClient(key, appId);
+        client.Timeout(15000);
+
+        // GetNumberOfCurrentPlayers：无需 key（v1 文档只要求 appid）
+        SteamResponse r = await client.GetNumberOfCurrentPlayersAsync();
+        Console.WriteLine("player_count=" + r.Int("response.player_count", -1));
+        Check(r.Int("response.result", 0) == 1, "online player count result=1");
+
+        // GetPlayerSummaries：需要 key；无效 key 时线上回 403 -> SteamException
+        List<string> ids = new List<string>();
+        ids.Add("76561197960287930");
+        try {
+            await client.GetPlayersAsync(ids);
+            Check(true, "online summaries (key accepted or ignored)");
+        } catch (SteamException e) {
+            Check(e.Code == "http.403", "online summaries 403 -> http.403 ("
+                + e.Code + ")");
+        }
+        return 0;
+    }
+
+    static async int Run() {
+        await Program.OfflineSuite();
+        if (Environment.ArgCount() >= 2) {
+            int appId = 480;
+            if (Environment.ArgCount() >= 3) {
+                appId = Convert.ToInt32(Environment.ArgAt(2));
+            }
+            Console.WriteLine("-- online smoke against api.steampowered.com --");
+            await Program.OnlineSmoke(Environment.ArgAt(1), appId);
+        } else {
+            Console.WriteLine("(offline suite only; pass <webApiKey> <appId> "
+                + "for an online smoke)");
+        }
+        if (failures == 0) {
+            Console.WriteLine("ALL PASS");
+            return 0;
+        }
+        Console.WriteLine("FAILURES: " + Convert.ToString(failures));
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

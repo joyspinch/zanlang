@@ -1,0 +1,1 @@
+{"tooltip":{"trigger":"axis"},"legend":{"data":["bar","error"]},"dataZoom":[{"type":"slider","filterMode":"none"},{"type":"inside","filterMode":"none"}],"xAxis":{},"yAxis":{},"series":[{"type":"custom","clip":true,"data":[[85,30],[83,106],[99,324],[46,151],[38,61],[68,385],[72,389]]}]}

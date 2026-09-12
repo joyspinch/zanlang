@@ -1,0 +1,1 @@
+{"xAxis":{"data":["a","b","c","d"],"axisTick":{"show":false},"axisLabel":{"formatter":"barGap: '-100%'"}},"yAxis":{"splitLine":{"show":false}},"animationDurationUpdate":1200,"series":[{"type":"bar","itemStyle":{"normal":{"color":"#ddd"}},"silent":true,"barWidth":40,"barGap":"-100%","data":[60,60,60,60]},{"type":"bar","barWidth":40,"z":10,"data":[45,60,13,25]}]}

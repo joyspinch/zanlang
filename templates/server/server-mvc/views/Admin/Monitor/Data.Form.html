@@ -1,0 +1,9 @@
+<form data-submit action="/admin/monitor/data/save">
+  <input type="hidden" name="t" value="{{t}}">
+  <input type="hidden" name="id" value="{{id}}">
+  <div class="form">{{{fieldsHtml}}}</div>
+  <footer style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+    <button class="btn" type="button" data-close>取消</button>
+    <button class="btn primary" type="submit">保存</button>
+  </footer>
+</form>

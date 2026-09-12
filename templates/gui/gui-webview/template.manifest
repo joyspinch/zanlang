@@ -1,0 +1,15 @@
+name=Web Browser Window
+name.zh=多标签浏览器窗口
+desc=Tabbed browser: navigation tool strip, address bar, closable tabs each owning its own native web view, status bar.
+desc.zh=多标签浏览器：导航工具条、地址栏、每个标签一个独立原生网页视图的可关闭标签页、状态栏。
+category=Window App
+icon=globe
+kind=copy
+type=gui
+target=exe
+entry=src/App.zan
+order=1090
+category.zh=窗口应用
+sizeable=1
+size=1100x760
+sketch=titlebar,toolbar,tabs,webview,statusbar

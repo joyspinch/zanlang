@@ -1,0 +1,28 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Lic;
+
+/* 可授权的产品。productId 是客户端 SDK 里 Product("...") 传的字符串键；
+ * secret 用于将来对账/回调签名，不参与激活握手。*/
+[Table(Name = "lic_product")]
+class Product {
+    [Column(IsIdentity = true)]
+    int id;
+
+    [Column(StringLength = 64, IsNullable = false)]
+    string productId;
+
+    [Column(StringLength = 128, IsNullable = false)]
+    string name;
+
+    [Column(StringLength = 128)]
+    string secret;
+
+    /* 1=启用；禁用后该产品的激活/登录全部拒绝，已发会话心跳被拒。*/
+    int status;
+
+    [Column(StringLength = 256)]
+    string note;
+
+    long createdAt;
+}

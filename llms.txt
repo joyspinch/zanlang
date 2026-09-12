@@ -1,0 +1,44 @@
+# Zan SDK
+
+Zan is a modern systems programming language: C#-style syntax, an LLVM backend,
+ARC memory management, and a standard library distributed as `.zan` sources.
+This folder is a complete, self-contained SDK — run `ZanIDE.exe`, or use
+`toolchain\zanc.exe` from a terminal. No installation step.
+
+Compile a program:
+
+```
+toolchain\zanc.exe <file.zan> --auto-stdlib -o out.exe
+```
+
+## Docs
+
+- [AI onboarding](docs/AI_ONBOARDING.md): connect an AI coding tool to Zan — how an agent works correctly without crawling sources.
+- [Tooling](docs/TOOLING.md): the language server (`zan-lsp`) and debug adapter (`zan-dap`) — what they speak and how to drive them.
+- [MCP hosting](docs/MCP_HOSTING.md): run `tools\zan-mcp.exe` over stdio or HTTP, knowledge file layout.
+- [AI-assisted development](docs/ai-assist.md): AI-assisted development in Zan.
+- [AI dev infrastructure (CN)](docs/AI_DEV_INFRASTRUCTURE.md): the general scheme for agent-assisted development in the Zan ecosystem.
+- [AI_README.md](AI_README.md) (中文): overview of every AI integration path and when to use which.
+
+## Rules
+
+- [ai/AGENTS.md](ai/AGENTS.md): rules for any AI agent working in a Zan project (look APIs up before using them, verify with the compiler, workspace conventions).
+
+## Knowledge (machine-readable)
+
+- [knowledge/symbols.json](knowledge/symbols.json): standard-library symbol index, one entry per type/member.
+- [knowledge/gallery.seed.json](knowledge/gallery.seed.json), [knowledge/zform.doc.json](knowledge/zform.doc.json): component gallery seed and `.zform` designer control docs.
+
+## Skills
+
+- [ai/skills/](ai/skills/): agent skills shipped with the SDK (game-dev, game-online, gui-design, zan-development, zan-debugging, zan-mcp, …).
+
+## Layout
+
+- `ZanIDE.exe` — the IDE (double-click to start; keep it next to the folders below)
+- `toolchain/` — `zanc.exe` (compiler), `zan-lsp.exe`, `zan-dap.exe`, `zanfmt.exe`, `zandoc.exe`, `repomap.exe`, `ld.exe`, cross-target drivers and sysroots
+- `stdlib/` — standard library sources
+- `templates/` — project templates (console, gui, game, server, …)
+- `examples/` — runnable example programs
+- `tools/` — `zan-mcp.exe` and other dev tools
+- `ai/` — agent onboarding pack: `AGENTS.md`, MCP client configs, skills

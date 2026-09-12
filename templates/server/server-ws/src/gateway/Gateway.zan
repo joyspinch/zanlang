@@ -1,0 +1,48 @@
+using System;
+using System.Net;
+
+namespace WsGateway;
+
+/* 连接注册表：以 Worker.Connection 为主键的在线客户端列表，供广播/统计。 */
+/* Worker 已接管握手、帧编解码、ping/pong 与分片重组；这里只登记/移除/推送。 */
+class Gateway {
+    static List<Connection> conns = new List<Connection>();
+
+    /* 连接建立时登记（Worker onOpen 回调里调用）。*/
+    static void Add(Connection conn) {
+        conns.Add(conn);
+    }
+
+    /* 连接断开时移除（Worker onClose 回调里调用）。*/
+    static void Remove(Connection conn) {
+        int id = conn.GetId();
+        int i = 0;
+        while (i < conns.Count) {
+            if (conns[i].GetId() == id) {
+                conns.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    static int Count() { return conns.Count; }
+
+    /* 向单个客户端推送文本。Connection.Send 是异步队列写（帧的编解码在 Worker）。*/
+    static int Push(Connection conn, string text) {
+        if (conn.IsClosed()) { return 0; }
+        conn.Send(text);
+        return 1;
+    }
+
+    /* 向所有在线客户端广播文本，返回成功投递数。*/
+    static int Broadcast(string text) {
+        int sent = 0;
+        int i = 0;
+        while (i < conns.Count) {
+            if (Push(conns[i], text) > 0) { sent = sent + 1; }
+            i = i + 1;
+        }
+        return sent;
+    }
+}

@@ -1,0 +1,10 @@
+# This is a binary SDK distribution: no line-ending conversion anywhere.
+* -text
+
+# IDE runtime state (created next to the exe when it runs)
+config/
+cache/
+publish/
+
+# crash/run logs written next to the exes
+*.log

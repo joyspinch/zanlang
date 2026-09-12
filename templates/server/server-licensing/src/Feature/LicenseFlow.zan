@@ -1,0 +1,345 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using ZanWeb.Model.Lic;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 授权域核心：激活码/账号两条授权路径 + 设备绑定 + 在线座位。
+ *
+ * 契约（与 stdlib/System/Commercial/LicenseClient.zan 逐字段对齐）：
+ *   POST /api/license/activate {product, code, device_fp}
+ *     -> {code:"0000", data:{mode,subject,session,expires_at,grace_seconds}}
+ *   POST /api/license/login    {product, account, password, device_fp}
+ *   POST /api/license/heartbeat{product, device_fp, session}
+ *   POST /api/license/logout   {product, session}
+ *
+ * 期限：durationDays 30/90/365=月/季/年，0=终身（expires_at=0）。
+ * 设备：maxDevices=0 不限，否则绑定数到顶拒绝，解绑后可换新。
+ * 座位：会话按"最近 seatsTtl 秒内有心跳"计数，到期座位自然腾出；
+ *       grace_seconds 下发 86400，SDK 断网后在宽限期内放行。*/
+class LicenseFlow {
+    IDbConnection db;
+
+    /* 座位判定窗口（秒）：5 分钟内无心跳的会话不再占座。*/
+    static int SeatsTtl = 300;
+
+    LicenseFlow(IDbConnection db) {
+        this.db = db;
+    }
+
+    static LicenseFlow Of(IDbConnection db) {
+        return new LicenseFlow(db);
+    }
+
+    /* ---- 激活码激活 ---- */
+
+    async string Activate(string productId, string code, string deviceFp,
+                          long now, JsonValue data) {
+        if (code.Length == 0 || deviceFp.Length == 0) {
+            return LicenseCodes.BadInput;
+        }
+        Product p = await LicenseFlow.ProductOf(this.db, productId);
+        if (p == null || p.status != 1) { return LicenseCodes.NoProduct; }
+
+        LicenseCode row = await this.db.Select<LicenseCode>()
+            .Where(a => a.codeDigest == LicenseFlow.Sha256Hex(code))
+            .FirstAsync();
+        if (row == null || row.productId != p.id) {
+            return LicenseCodes.BadCode;
+        }
+        if (row.status != 1) { return LicenseCodes.Revoked; }
+        if (row.redeemed == 0) {
+            /* 首次激活核销并定档：到期时刻从此刻起算。*/
+            long expires = row.durationDays > 0
+                ? now + (long)row.durationDays * 86400 : 0;
+            row.redeemed = 1;
+            row.redeemedAt = now;
+            int _n = await this.db.Update<LicenseCode>()
+                .Set(a => a.redeemed, 1)
+                .Set(a => a.redeemedAt, now)
+                .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            LicenseGrant g = new LicenseGrant();
+            g.productId = p.id;
+            g.codeId = row.id;
+            g.userId = 0;
+            g.account = "";
+            g.durationDays = row.durationDays;
+            g.expiresAt = expires;
+            g.maxDevices = row.maxDevices;
+            g.maxSeats = 0;
+            g.disabled = 0;
+            g.codeTail = row.codeTail;
+            g.note = "激活码 " + row.codeTail + " 首次激活生成";
+            g.createdAt = now;
+            row.note = row.note;
+            int gid = await this.db.Insert<LicenseGrant>(g)
+                .ExecuteIdentityAsync();
+            row.status = row.status;
+            if (gid <= 0) { return LicenseCodes.NoProduct; }
+            row.id = gid;
+        }
+        /* 已核销的码找到它的授权行（核销时按 codeId 建）。*/
+        LicenseGrant grant = await this.db.Select<LicenseGrant>()
+            .Where(a => a.codeId == row.id).OrderByDescending(a => a.id)
+            .FirstAsync();
+        if (grant == null) { return LicenseCodes.BadCode; }
+        if (grant.disabled == 1) { return LicenseCodes.Revoked; }
+        if (grant.expiresAt != 0 && grant.expiresAt <= now) {
+            return LicenseCodes.Expired;
+        }
+        if (!await LicenseFlow.DeviceOk(this.db, p.id, 0, grant.id,
+                grant.maxDevices, deviceFp)) {
+            return LicenseCodes.DeviceMismatch;
+        }
+        string session = await LicenseFlow.OpenSeat(this.db, p.id, row.id,
+            grant.id, 0, deviceFp, row.codeTail, grant.maxSeats, now);
+        if (session.Length == 0) { return LicenseCodes.SeatLimit; }
+        await LicenseFlow.TouchDevice(this.db, p.id, row.id, grant.id,
+            deviceFp, row.codeTail, "code", now);
+        LicenseFlow.WriteGrant(data, "code", row.codeTail, session,
+            grant.expiresAt, now);
+        return LicenseCodes.Ok;
+    }
+
+    /* ---- 账号密码登录 ---- */
+
+    async string Login(string productId, string account, string password,
+                       string deviceFp, long now, JsonValue data) {
+        if (account.Length == 0 || password.Length == 0
+            || deviceFp.Length == 0) {
+            return LicenseCodes.BadInput;
+        }
+        Product p = await LicenseFlow.ProductOf(this.db, productId);
+        if (p == null || p.status != 1) { return LicenseCodes.NoProduct; }
+
+        User user = await this.db.Select<User>()
+            .Where(a => a.username == account).FirstAsync();
+        if (user == null || user.status != AuthUser.Active) {
+            return LicenseCodes.BadAccount;
+        }
+        string actual = AuthUser.PasswordHash(password, user.passwordSalt);
+        if (!AuthToken.Equal(actual, user.passwordHash)) {
+            return LicenseCodes.BadAccount;
+        }
+        LicenseGrant grant = await this.db.Select<LicenseGrant>()
+            .Where(a => a.productId == p.id && a.userId == user.id)
+            .OrderByDescending(a => a.id).FirstAsync();
+        if (grant == null || grant.disabled == 1) {
+            return LicenseCodes.NoProduct;
+        }
+        if (grant.expiresAt != 0 && grant.expiresAt <= now) {
+            return LicenseCodes.Expired;
+        }
+        if (!await LicenseFlow.DeviceOk(this.db, p.id, grant.id, grant.id,
+                grant.maxDevices, deviceFp)) {
+            return LicenseCodes.DeviceMismatch;
+        }
+        string session = await LicenseFlow.OpenSeat(this.db, p.id, 0,
+            grant.id, user.id, deviceFp, account, grant.maxSeats, now);
+        if (session.Length == 0) { return LicenseCodes.SeatLimit; }
+        await LicenseFlow.TouchDevice(this.db, p.id, 0, grant.id,
+            deviceFp, account, "account", now);
+        LicenseFlow.WriteGrant(data, "account", account, session,
+            grant.expiresAt, now);
+        return LicenseCodes.Ok;
+    }
+
+    /* ---- 心跳：续座 + 续期 ---- */
+
+    async string Heartbeat(string productId, string deviceFp, string session,
+                           long now, JsonValue data) {
+        if (session.Length == 0 || deviceFp.Length == 0) {
+            return LicenseCodes.BadInput;
+        }
+        Product p = await LicenseFlow.ProductOf(this.db, productId);
+        if (p == null || p.status != 1) { return LicenseCodes.NoProduct; }
+        LicenseSession seat = await this.db.Select<LicenseSession>()
+            .Where(a => a.sessionDigest == LicenseFlow.Sha256Hex(session))
+            .FirstAsync();
+        if (seat == null || seat.productId != p.id) {
+            return LicenseCodes.BadSession;
+        }
+        if (seat.deviceFp != deviceFp) { return LicenseCodes.DeviceMismatch; }
+        LicenseGrant grant = seat.grantId > 0
+            ? await this.db.Select<LicenseGrant>()
+                .Where(a => a.id == seat.grantId).FirstAsync()
+            : null;
+        if (grant == null) { return LicenseCodes.BadSession; }
+        if (grant.disabled == 1) { return LicenseCodes.Revoked; }
+        if (grant.expiresAt != 0 && grant.expiresAt <= now) {
+            return LicenseCodes.Expired;
+        }
+        int _n = await this.db.Update<LicenseSession>()
+            .Set(a => a.lastSeen, now)
+            .Where(a => a.id == seat.id).ExecuteAffrowsAsync();
+        LicenseFlow.WriteGrant(data, "account", seat.subject,
+            session, grant.expiresAt, now);
+        return LicenseCodes.Ok;
+    }
+
+    /* ---- 登出：释放座位 ---- */
+
+    async string Logout(string productId, string session, long now) {
+        Product p = await LicenseFlow.ProductOf(this.db, productId);
+        if (p == null) { return LicenseCodes.NoProduct; }
+        LicenseSession seat = await this.db.Select<LicenseSession>()
+            .Where(a => a.sessionDigest == LicenseFlow.Sha256Hex(session))
+            .FirstAsync();
+        if (seat == null) { return LicenseCodes.Ok; }
+        int _n = await this.db.Delete<LicenseSession>()
+            .Where(a => a.id == seat.id).ExecuteAffrowsAsync();
+        return LicenseCodes.Ok;
+    }
+
+    /* ---- 服务端管理动作（后台按钮调用） ---- */
+
+    /* 解绑设备：把该设备从授权的绑定表与会话表移除，用户即可在新机器重新激活。*/
+    static async bool UnbindDevice(IDbConnection db, int deviceId) {
+        LicenseDevice dev = await db.Select<LicenseDevice>()
+            .Where(a => a.id == deviceId).FirstAsync();
+        if (dev == null) { return false; }
+        int _d = await db.Delete<LicenseDevice>()
+            .Where(a => a.id == deviceId).ExecuteAffrowsAsync();
+        int _s = await db.Delete<LicenseSession>()
+            .Where(a => a.productId == dev.productId
+                && a.deviceFp == dev.deviceFp
+                && a.grantId == dev.grantId).ExecuteAffrowsAsync();
+        return true;
+    }
+
+    /* ---- 内部件 ---- */
+
+    static async Product ProductOf(IDbConnection db, string productId) {
+        if (productId.Length == 0) { return null; }
+        return await db.Select<Product>()
+            .Where(a => a.productId == productId).FirstAsync();
+    }
+
+    /* 设备绑定检查：maxDevices=0 不限；已绑定放行（同一设备重复激活是续期
+     * 而非新占位）；未绑定且绑定数已满拒绝。*/
+    static async bool DeviceOk(IDbConnection db, int productId, int grantId,
+                               int bindGrantId, int maxDevices,
+                               string deviceFp) {
+        if (maxDevices <= 0) { return true; }
+        List<LicenseDevice> bound = await db.Select<LicenseDevice>()
+            .Where(a => a.productId == productId
+                && a.grantId == bindGrantId).ToListAsync();
+        for (int i = 0; i < bound.Count; i = i + 1) {
+            if (bound[i].deviceFp == deviceFp) { return true; }
+        }
+        return bound.Count < maxDevices;
+    }
+
+    /* 打开座位：复用同设备同授权的旧会话，否则新建；座位已满返回 ""。
+       库里只存返回令牌的散列——落库者无法从库反推可用会话。*/
+    static async string OpenSeat(IDbConnection db, int productId, int codeId,
+                                 int grantId, int userId, string deviceFp,
+                                 string subject, int maxSeats, long now) {
+        string token = "LS-" + Guid.New().Replace("-", "").Substring(0, 24);
+        string digest = LicenseFlow.Sha256Hex(token);
+        if (maxSeats > 0) {
+            List<LicenseSession> live = await db.Select<LicenseSession>()
+                .Where(a => a.productId == productId
+                    && a.grantId == grantId).ToListAsync();
+            int taken = 0;
+            for (int i = 0; i < live.Count; i = i + 1) {
+                if (live[i].deviceFp == deviceFp) {
+                    /* 本设备回归：旧会话直接顶掉，不占新座。*/
+                    int _g = await db.Delete<LicenseSession>()
+                        .Where(a => a.id == live[i].id).ExecuteAffrowsAsync();
+                    continue;
+                }
+                if (now - live[i].lastSeen <= LicenseFlow.SeatsTtl) {
+                    taken = taken + 1;
+                }
+            }
+            if (taken >= maxSeats) { return ""; }
+        }
+        LicenseSession seat = new LicenseSession();
+        seat.productId = productId;
+        seat.codeId = codeId;
+        seat.grantId = grantId;
+        seat.userId = userId;
+        seat.sessionDigest = digest;
+        seat.deviceFp = deviceFp;
+        seat.subject = subject;
+        seat.lastSeen = now;
+        seat.createdAt = now;
+        int _id = await db.Insert<LicenseSession>(seat).ExecuteIdentityAsync();
+        return token;
+    }
+
+    /* 绑定/刷新设备行：存在即刷新主体，不存在且额度未满即新增。*/
+    static async bool TouchDevice(IDbConnection db, int productId,
+                                  int codeId, int grantId, string deviceFp,
+                                  string subject, string mode, long now) {
+        LicenseDevice have = await db.Select<LicenseDevice>()
+            .Where(a => a.productId == productId && a.grantId == grantId
+                && a.deviceFp == deviceFp).FirstAsync();
+        if (have != null) {
+            int _u = await db.Update<LicenseDevice>()
+                .Set(a => a.subject, subject)
+                .Where(a => a.id == have.id).ExecuteAffrowsAsync();
+            return true;
+        }
+        LicenseDevice dev = new LicenseDevice();
+        dev.productId = productId;
+        dev.codeId = codeId;
+        dev.grantId = grantId;
+        dev.deviceFp = deviceFp;
+        dev.subject = subject;
+        dev.mode = mode;
+        dev.createdAt = now;
+        int _id = await db.Insert<LicenseDevice>(dev).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    /* 按契约写 data：{mode, subject, session, expires_at, grace_seconds}。*/
+    static void WriteGrant(JsonValue data, string mode, string subject,
+                           string session, long expiresAt, long now) {
+        data.Put("mode", JsonValue.NewStr(mode));
+        data.Put("subject", JsonValue.NewStr(subject));
+        data.Put("session", JsonValue.NewStr(session));
+        data.Put("expires_at", JsonValue.NewNum(Convert.ToString(expiresAt)));
+        data.Put("grace_seconds", JsonValue.NewNum("86400"));
+        data.Put("heartbeat", JsonValue.NewNum("300"));
+        data.Put("now", JsonValue.NewNum(Convert.ToString(now)));
+    }
+
+    static string Sha256Hex(string text) {
+        return Hex.Encode(Sha256.Hash(text, text.Length), 32);
+    }
+
+    static string RandDigits(int count) {
+        string outp = "";
+        while (outp.Length < count) {
+            string g = Guid.New();
+            for (int i = 0; i < g.Length && outp.Length < count; i = i + 1) {
+                char c = g[i];
+                if (c >= 48 && c <= 57) { outp = outp + c; }
+            }
+        }
+        return outp;
+    }
+
+    /* 激活码明文：XXXX-XXXX-XXXX-XXXX（去易混淆字符后随机），返回一次。*/
+    static string NewCodeText() {
+        string alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+        string raw = LicenseFlow.RandDigits(16);
+        string mixed = "";
+        string g = Guid.New() + Guid.New();
+        for (int i = 0; i < 16; i = i + 1) {
+            /* 用 GUID 字符决定取表位，避开纯数字编码；实现保持确定性长度。*/
+            int idx = (g[i % g.Length] * 7 + i * 31) % alphabet.Length;
+            if (idx < 0) { idx = idx + alphabet.Length; }
+            mixed = mixed + alphabet[idx];
+        }
+        if (raw.Length != 16) { raw = "0000000000000000"; }
+        string c = mixed.Length == 16 ? mixed : raw;
+        return c.Substring(0, 4) + "-" + c.Substring(4, 4) + "-"
+            + c.Substring(8, 4) + "-" + c.Substring(12, 4);
+    }
+}

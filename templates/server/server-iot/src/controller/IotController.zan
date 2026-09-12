@@ -1,0 +1,107 @@
+using System;
+using System.Net.Mqtt;
+using System.Json;
+
+namespace ZanWeb;
+
+/* MQTT 代理管理 API。路由由控制器位置+动作约定生成（"iot"+action），路径参数或自定义前缀时以 [Route] 覆盖。各动作通过 MqttBroker.Instance() 读取实时代理注册表。 */
+class IotController {
+    [Get]
+    [Title("客户端列表")]
+    [Menu]
+    static async void Clients(HttpContext ctx) {
+        Reply.Ok(ctx, MqttBroker.Instance().ClientsJson());
+    }
+
+    [Get]
+    [Route("/iot/clients/{id}")]
+    [Title("客户端详情")]
+    static async void Client(HttpContext ctx) {
+        string id = ctx.In("id");
+        string data = MqttBroker.Instance().ClientDetailJson(id);
+        if (data.Length == 0) {
+            Reply.Fail(ctx, 404, "2001", "client not found");
+            return;
+        }
+        Reply.Ok(ctx, data);
+    }
+
+    [Post]
+    [Route("/iot/clients/{id}/kick")]
+    [Title("踢下线")]
+    [Auth]
+    [Rank(9)]
+    [Lock("global")]
+    static async void Kick(HttpContext ctx) {
+        string id = ctx.In("id");
+        if (MqttBroker.Instance().Kick(id)) {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("kicked", JsonValue.NewStr(id));
+            Reply.Ok(ctx, o.ToJson());
+        } else {
+            Reply.Fail(ctx, 404, "2001", "client not found");
+        }
+    }
+
+    [Get]
+    [Title("订阅管理")]
+    [Menu]
+    static async void Subscriptions(HttpContext ctx) {
+        Reply.Ok(ctx, MqttBroker.Instance().SubscriptionsJson());
+    }
+
+    [Get]
+    [Title("主题列表")]
+    [Menu]
+    static async void Topics(HttpContext ctx) {
+        Reply.Ok(ctx, MqttBroker.Instance().TopicsJson());
+    }
+
+    /* 看板用的代理专用指标（不含 HTTP 内部指标）。 */
+    [Get]
+    [Title("broker指标")]
+    static async void Metrics(HttpContext ctx) {
+        Reply.Ok(ctx, MqttBroker.Instance().MetricsJson());
+    }
+
+    /* 以代理身份向主题注入消息（扇出给所有匹配订阅者）；topic 必填，payload 原样取用。 */
+    [Post]
+    [Title("发布消息")]
+    [Auth]
+    [Rank(3)]
+    static async void Publish(HttpContext ctx) {
+        string topic = ctx.In("topic");
+        if (topic.Length == 0) {
+            Reply.Fail(ctx, 422, "2002", "topic required");
+            return;
+        }
+        string payload = ctx.InRaw("payload");
+        int n = MqttBroker.Instance().Publish(topic, payload);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("topic", JsonValue.NewStr(topic));
+        o.Put("delivered", JsonValue.NewNum(Convert.ToString(n)));
+        Reply.Ok(ctx, o.ToJson());
+    }
+
+    /* 性能检测：代理吞吐/客户端 + HTTP 运行期指标的单快照。 */
+    [Get]
+    [Route("/admin/stats")]
+    [Title("性能检测")]
+    [Auth]
+    [Rank(9)]
+    [Menu]
+    static async void Stats(HttpContext ctx) {
+        string broker = MqttBroker.Instance().MetricsJson();
+        string http = WebHost.Current().MetricsJson();
+        JsonValue data = JsonValue.NewObject();
+        JsonValue b = JsonValue.ParseLenient(broker);
+        if (b != null) { data.Put("broker", b); }
+        JsonValue h = JsonValue.ParseLenient(http);
+        if (h != null) { data.Put("http", h); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("code", JsonValue.NewStr("0000"));
+        o.Put("msg", JsonValue.NewStr("ok"));
+        o.Put("data", data);
+        ctx.Json(o.ToJson());
+    }
+}

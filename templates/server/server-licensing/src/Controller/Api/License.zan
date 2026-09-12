@@ -1,0 +1,116 @@
+using System;
+using System.Json;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Api;
+
+/* 授权端点：路由 /api/license/activate|login|heartbeat|logout。
+ * 请求/响应与 stdlib/System/Commercial/LicenseClient.zan 的契约一一对应：
+ * 请求为 JSON 正文（SDK PostJson 发送），统一答 {"code","msg","data"}，
+ * data={mode,subject,session,expires_at,grace_seconds}。
+ * 全部匿名可调（激活码与账号密码本身就是凭证），ApiMax 限流防爆破。*/
+[Route("api/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("产品授权")]
+class License : ApiController {
+    [HttpPost]
+    [Custom(ApiMax = 30)]
+    [Description("激活码激活")]
+    async void Activate() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue body = this.ctx.JsonBody();
+        if (body == null || !body.IsObject()) {
+            this.Fail(400, LicenseCodes.BadInput, "bad body");
+            return;
+        }
+        JsonValue data = JsonValue.NewObject();
+        string result = await LicenseFlow.Of(this.Held()).Activate(
+            body.Str("product", ""), body.Str("code", ""),
+            body.Str("device_fp", ""), WebApp.NowSeconds(), data);
+        if (result != LicenseCodes.Ok) {
+            this.Fail(422, result, License.Reason(result));
+            return;
+        }
+        this.Ok(data.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(ApiMax = 30)]
+    [Description("账号密码登录授权")]
+    async void Login() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue body = this.ctx.JsonBody();
+        if (body == null || !body.IsObject()) {
+            this.Fail(400, LicenseCodes.BadInput, "bad body");
+            return;
+        }
+        JsonValue data = JsonValue.NewObject();
+        string result = await LicenseFlow.Of(this.Held()).Login(
+            body.Str("product", ""), body.Str("account", ""),
+            body.Str("password", ""), body.Str("device_fp", ""),
+            WebApp.NowSeconds(), data);
+        if (result != LicenseCodes.Ok) {
+            this.Fail(422, result, License.Reason(result));
+            return;
+        }
+        this.Ok(data.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(ApiMax = 120)]
+    [Description("会话心跳")]
+    async void Heartbeat() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue body = this.ctx.JsonBody();
+        if (body == null || !body.IsObject()) {
+            this.Fail(400, LicenseCodes.BadInput, "bad body");
+            return;
+        }
+        JsonValue data = JsonValue.NewObject();
+        string result = await LicenseFlow.Of(this.Held()).Heartbeat(
+            body.Str("product", ""), body.Str("device_fp", ""),
+            body.Str("session", ""), WebApp.NowSeconds(), data);
+        if (result != LicenseCodes.Ok) {
+            this.Fail(422, result, License.Reason(result));
+            return;
+        }
+        this.Ok(data.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(ApiMax = 30)]
+    [Description("登出并释放座位")]
+    async void Logout() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue body = this.ctx.JsonBody();
+        if (body == null || !body.IsObject()) {
+            this.Fail(400, LicenseCodes.BadInput, "bad body");
+            return;
+        }
+        string result = await LicenseFlow.Of(this.Held()).Logout(
+            body.Str("product", ""), body.Str("session", ""),
+            WebApp.NowSeconds());
+        if (result != LicenseCodes.Ok) {
+            this.Fail(422, result, License.Reason(result));
+            return;
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("released", JsonValue.NewBool(true));
+        this.Ok(o.ToJson());
+    }
+
+    /* 业务码 -> 人话；SDK 会把这句话直接展示给最终用户。*/
+    static string Reason(string code) {
+        if (code == LicenseCodes.BadInput) { return "请求参数不完整"; }
+        if (code == LicenseCodes.NoProduct) { return "产品不存在或未开放授权"; }
+        if (code == LicenseCodes.BadCode) { return "激活码无效"; }
+        if (code == LicenseCodes.BadAccount) { return "账号或密码不正确，或该账号没有本产品的授权"; }
+        if (code == LicenseCodes.Expired) { return "授权已过期，请续费或更换授权"; }
+        if (code == LicenseCodes.DeviceMismatch) { return "设备绑定数已满，请联系服务方解绑后重试"; }
+        if (code == LicenseCodes.SeatLimit) { return "在线终端数已达上限，请退出其他设备后再试"; }
+        if (code == LicenseCodes.Revoked) { return "授权已被停用"; }
+        if (code == LicenseCodes.BadSession) { return "会话无效，请重新激活"; }
+        return "授权失败";
+    }
+}

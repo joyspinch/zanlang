@@ -1,0 +1,13 @@
+name=Licensing Server
+name.zh=授权服务端
+category=Server
+icon=key-chain
+kind=copy
+type=console
+target=exe
+entry=src/main.zan
+order=86
+desc=C-end product licensing server: activation codes and account-password activation, monthly/quarterly/yearly/lifetime grants, device binding and online seats, admin console.
+desc.zh=C 端成品软件授权服务端：激活码/账号密码双通道激活，按月/季/年/终身授权，设备绑定与在线座位限制，管理后台发码/发授权/解绑。
+category.zh=服务端
+sketch=server

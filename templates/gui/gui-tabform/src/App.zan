@@ -1,0 +1,12 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/* {{NAME}} 业务逻辑：DocumentTabs 每个打开的文档占一页，各页控件在 {{NAME}}.zform 中设计。 */
+partial class {{NAME}} {
+    static void OnLoad(Form form) {
+        MainToolStrip.OnItemClick((int index) => {
+            MainStatusBar.SetText(0, "命令 " + Convert.ToString(index));
+        });
+    }
+}

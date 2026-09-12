@@ -1,0 +1,39 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Lic;
+
+/* 激活码。code 只存 SHA-256 摘要（明文只在生成那一刻返回一次）；
+ * durationDays 决定授权期：30/90/365=按月/季/年，0=终身；
+ * maxDevices=0 不限设备，否则激活设备数到此为止，换绑走服务端解绑。*/
+[Table(Name = "lic_code")]
+class LicenseCode {
+    [Column(IsIdentity = true)]
+    int id;
+
+    [Column(IsNullable = false)]
+    int productId;
+
+    [Column(StringLength = 64, IsNullable = false)]
+    string codeDigest;
+
+    [Column(StringLength = 32)]
+    string codeTail;
+
+    /* 30/90/365 = 按月/季/年；0 = 终身。*/
+    int durationDays;
+
+    /* 0 = 不限设备；>0 = 最多绑定设备数。*/
+    int maxDevices;
+
+    /* 1=可用 0=停用；激活即核销由 redeemed 表达，status 是管理开关。*/
+    int status;
+
+    int redeemed;
+
+    long redeemedAt;
+
+    [Column(StringLength = 256)]
+    string note;
+
+    long createdAt;
+}

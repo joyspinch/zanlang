@@ -1,0 +1,15 @@
+using System;
+
+namespace ZanWeb;
+
+/* 提供代理管理看板（单页轮询 /iot/<wildcard> JSON API）。 */
+class HomeController {
+    [Get]
+    [Route("/")]
+    [Title("控制台")]
+    static async void Index(HttpContext ctx) {
+        ViewData d = new ViewData();
+        d.Set("title", "{{NAME}} IoT Console");
+        ctx.Html(WebHost.Current().RenderPage("index", d));
+    }
+}

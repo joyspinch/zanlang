@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "zan": {
+      "type": "stdio",
+      "command": "<ZAN_MCP>",
+      "args": ["--stdio", "."],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,30 @@
+// QEMU bare-metal probe: exception paths on the metal. throw/catch lowers
+// onto _setjmp/longjmp + the EH state tables (calloc'd chunks in the pool),
+// and the await inside the catch body suspends the frame while the caught
+// exception is live -- the same paths the host conformance suite exercises,
+// now with no OS underneath. Three rounds, one await per catch, then exit 0.
+using System;
+
+class Program {
+    static void Boom(int i) {
+        throw new Exception("boom" + Convert.ToString(i));
+    }
+
+    static async int Bump(int x) {
+        await Task.Delay(2);
+        return x + 1;
+    }
+
+    static void Main() {
+        int total = 0;
+        for (int i = 0; i < 3; i = i + 1) {
+            try {
+                Boom(i);
+            } catch (Exception e) {
+                Console.WriteLine("caught " + e.Message);
+                total = await Bump(total);
+            }
+        }
+        Console.WriteLine("total " + total);
+    }
+}

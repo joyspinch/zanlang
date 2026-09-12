@@ -1,0 +1,358 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 22「交易市场」——照原版逐像素还原（`mir2/mir/交易市场.png`）。
+///
+/// 版式 = 一个 715 设备高的浮窗外框（374..1491 × 164..879，不铺满页区）：
+///   · 顶带满宽（377..1489 × 167..204）：左「物品分类」（区宽 = 表格左沿，
+///     右侧 1 设备竖线）+ 名称/价格/寄售人/加密/时长/操作 六个表头，同一条带。
+///   · 中排：左栏 389..529 —— 8 枚分类钮（38 高、节距 48）+「过滤条件」带
+///     + 寄售人/道具名称 两组黄标签 + 输入框 + 过滤加密复选框 +「搜索」钮；
+///     左栏无自底色，外框底直接透出。
+///   · 右：表格盒 539..1490（黑底 `#050708`），8 行、行高 70、节距 75，行是
+///     `#182128` + 1 设备边的盒子；名称列 = `00211.png` 通用物品格
+///     （`SpriteCell`）+ 名称/数量两行字。
+///   · 页脚 812..877 同样无自底色：我的寄售 / 一键领取 / 重新上架
+///     + 标准库 Pagination（上一页 / 1/649 / 下一页 + 跳转到）。
+///
+/// 数据一行一实体（`MarketRow`）：价格存数（原版「1,0000」是万位分隔 →
+/// `Rules.Wan`）、时长存 天+时分秒、角标由道具类别推（强化 +N / 天书 N/10%）。
+///
+/// 配色（原版实测）：名称黄 `#d0d000`、数量灰 `#707070`、价格 `#d0d0d0`
+/// （金币图左锚 798、数字左锚 849）、寄售人品红 `#d000d0`、加密青 `#00f4f4`
+/// + 锁标 `00255.png`、时长橙 `#ff8000`、表头/钮字 `#00aeff`、标签黄
+/// `#ffff00`、输入框底 `#171e29`。
+partial class LegendApp {
+    /// 一行寄售数据。
+    class MarketRow {
+        int picture;        // 道具图（items.csv picture 号）
+        string name;
+        int kind;           // 0 堆叠（数量：N，无角标）/ 1 强化（系数：N，角标 +N）/ 2 天书（系数：N，角标 N/10%）
+        int amount;
+        long price;         // 金币
+        string seller;
+        string tag;         // 加密标签（s1 / s11 / s21；空 = 无）
+        bool locked;        // 锁标
+        int days;
+        int hh;
+        int mm;
+        int ss;
+        string SubText() { return (kind == 0 ? "数量：" : "系数：") + Rules.N(amount); }
+        string BadgeText() {
+            if (kind == 1) { return "+" + Rules.N(amount); }
+            if (kind == 2) { return Rules.N(amount / 10) + "." + Rules.N(amount % 10) + "%"; }
+            return "";
+        }
+        string PriceText() { return Rules.Wan(price); }
+        string TimeText() {
+            return Rules.N(days) + "天 " + Rules.N(hh).PadLeft(2, "0") + ":"
+                + Rules.N(mm).PadLeft(2, "0") + ":" + Rules.N(ss).PadLeft(2, "0");
+        }
+    }
+
+    /// 8 行寄售数据（照 `交易市场.png` 逐行抄录）。魔法天书 / 魔防天书在道具表
+    /// 里只有一个通用「天书」（picture 2658），两行同图——登记为素材偏差。
+    static List<MarketRow> marketData = null;
+    static List<MarketRow> MarketData() {
+        if (marketData != null) { return marketData; }
+        List<MarketRow> v = new List<MarketRow>();
+        v.Add(MarketRowOf(2621, "符文:1#", 0, 1, 10000, "oopo", "s1", true, 499, 20, 0, 41));
+        v.Add(MarketRowOf(2658, "魔法天书", 2, 113, 1000000, "歼20", "s11", false, 499, 19, 35, 49));
+        v.Add(MarketRowOf(642, "二级宝石", 1, 4, 50000000, "无敌奶糖", "", false, 499, 18, 37, 52));
+        v.Add(MarketRowOf(642, "二级宝石", 1, 7, 50000000, "无敌奶糖", "", false, 499, 18, 37, 50));
+        v.Add(MarketRowOf(642, "二级宝石", 1, 6, 70000000, "法师", "s21", false, 499, 18, 35, 51));
+        v.Add(MarketRowOf(642, "二级宝石", 1, 6, 60000000, "法师", "s21", false, 499, 18, 35, 47));
+        v.Add(MarketRowOf(685, "真魂项链", 1, 3, 30000000, "无敌绵羊", "", false, 499, 18, 35, 33));
+        v.Add(MarketRowOf(2658, "魔防天书", 2, 284, 30000000, "无敌绵羊", "", false, 499, 18, 35, 32));
+        marketData = v;
+        return marketData;
+    }
+
+    static MarketRow MarketRowOf(int picture, string name, int kind, int amount,
+                                 long price, string seller, string tag, bool locked,
+                                 int days, int hh, int mm, int ss) {
+        MarketRow r = new MarketRow();
+        r.picture = picture; r.name = name; r.kind = kind; r.amount = amount;
+        r.price = price; r.seller = seller; r.tag = tag; r.locked = locked;
+        r.days = days; r.hh = hh; r.mm = mm; r.ss = ss;
+        return r;
+    }
+
+    /// 左栏 8 枚分类（原版顺序）。
+    static List<string> MarketCats() {
+        List<string> c = new List<string>();
+        c.Add("全部"); c.Add("武器"); c.Add("防具"); c.Add("首饰");
+        c.Add("消耗类"); c.Add("杂物类"); c.Add("材料类"); c.Add("符文");
+        return c;
+    }
+
+    static List<string> MarketHeads() {
+        List<string> h = new List<string>();
+        h.Add("名称"); h.Add("价格"); h.Add("寄售人"); h.Add("加密");
+        h.Add("时长"); h.Add("操作");
+        return h;
+    }
+
+    void BuildMarketPage() {
+        Panel frame = Panel.Column(); frame.Class = "mk-frame";
+        frame.Pad(0); frame.Gap(0);
+        frame.Prefer(0, Spec.MkFrameH());
+        frame.Padding(Spec.MkFramePadT(), Spec.MkFramePadR(), 0, Spec.MkFramePadL());
+        content.With(frame);
+
+        frame.With(MarketHeadBand());
+
+        // flex 容器里 Grow() 无效——撑满走 CSS .mk-fill（见 skin.css 注）
+        Panel mid = Panel.Row(); mid.Class = "mk-mid mk-fill";
+        mid.Pad(0); mid.Gap(Spec.MkColGap());
+        mid.Padding(0, 0, 0, Spec.MkMidPadL());
+        mid.With(MarketLeft());
+        mid.With(MarketRight());
+        frame.With(mid);
+    }
+
+    /// 右栏 = 表格盒（撑满）+ 页脚（固定高）；左栏的搜索钮与页脚钮同顶。
+    Panel MarketRight() {
+        Panel col = Panel.Column(); col.Class = "mk-right mk-fill";
+        col.Pad(0); col.Gap(0);
+        col.With(MarketTable());
+        col.With(MarketFoot());
+        return col;
+    }
+
+    // ------------------------------------------------------------------
+    //  顶带：满宽，物品分类区 + 六表头
+    // ------------------------------------------------------------------
+    Panel MarketHeadBand() {
+        Panel wrap = Panel.Column(); wrap.Class = "mk-fixed"; wrap.Pad(0); wrap.Gap(0);
+        wrap.Prefer(0, Spec.MkBandH() + Spec.MkBandLine());
+        Panel band = Panel.Row(); band.Class = "mk-band";
+        band.Pad(0); band.Gap(0); band.Prefer(0, Spec.MkBandH());
+
+        Panel lz = Panel.Row(); lz.Class = "mk-cell"; lz.Pad(0);
+        lz.Prefer(Spec.MkBandLabelW(), Spec.MkBandH());
+        lz.Padding(0, 0, 0, Spec.MkBandLabelPadL());
+        lz.With(Text("物品分类", "mk-band-t", 0));
+        band.With(lz);
+        Panel ln = Panel.Row(); ln.Class = "mk-band-line"; ln.Pad(0);
+        ln.Prefer(Spec.Px(1), Spec.MkBandH());
+        band.With(ln);
+        Panel lg = Panel.Row(); lg.Pad(0);
+        lg.Prefer(Spec.MkBandLabelGap(), Spec.MkBandH());
+        band.With(lg);
+
+        List<int> ws = Spec.MkHeadCols();
+        List<string> heads = MarketHeads();
+        for (int i = 0; i < heads.Count; i = i + 1) {
+            Panel c = Panel.Row(); c.Class = "mk-cell"; c.Pad(0);
+            if (i + 1 < heads.Count) { c.Prefer(ws[i], Spec.MkBandH()); }
+            else { c.Class = "mk-cell mk-fill"; c.Prefer(0, Spec.MkBandH()); }
+            c.With(Text(heads[i], "mk-band-t", 0));
+            band.With(c);
+        }
+        wrap.With(band);
+        Panel line = Panel.Row(); line.Class = "mk-band-line";
+        line.Pad(0); line.Prefer(0, Spec.MkBandLine()); wrap.With(line);
+        return wrap;
+    }
+
+    // ------------------------------------------------------------------
+    //  左：分类 + 过滤条件
+    // ------------------------------------------------------------------
+    Panel MarketLeft() {
+        Panel p = Panel.Column(); p.Class = "mk-left mk-fixed";
+        p.Pad(0); p.Gap(0); p.Prefer(Spec.MkLeftW(), 0);
+        p.Padding(Spec.MkBandToBtn(), 0, 0, 0);
+
+        List<string> cats = MarketCats();
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            int pick = i;
+            Button b = Btn(cats[i], "tbl-btn mk-cat", () => { MarketPickCat(pick); });
+            b.Prefer(0, Spec.MkCatH());
+            p.With(b);
+            if (i + 1 < cats.Count) { p.With(TblPad(Spec.MkCatGap())); }
+        }
+        p.With(TblPad(Spec.MkBtnToBand()));
+        p.With(MarketBand("过滤条件"));
+
+        p.With(MarketLabel("寄售人:"));
+        Input seller = new Input(""); seller.Class = "mk-input";
+        seller.Prefer(0, Spec.MkInputH()); p.With(seller);
+        p.With(MarketLabel("道具名称:"));
+        Input item = new Input(""); item.Class = "mk-input";
+        item.Prefer(0, Spec.MkInputH()); p.With(item);
+
+        p.With(TblPad(Spec.MkInputToCheck()));
+        Panel ck = Panel.Row(); ck.Class = "mk-check-row";
+        ck.Pad(0); ck.Prefer(0, Spec.MkCheckH());
+        ck.Padding(0, 0, 0, Spec.MkCheckPadL());
+        SignalBool enc = new SignalBool(false);
+        Checkbox cb = Checkbox.Bind("过滤加密", enc); cb.Class = "mk-check";
+        ck.With(cb);
+        p.With(ck);
+
+        p.With(TblPad(Spec.MkCheckToBtn()));
+        Button s = Btn("搜索", "tbl-btn mk-cat", () => { MarketSearch(); });
+        s.Prefer(0, Spec.MkSearchH());
+        p.With(s);
+        return p;
+    }
+
+    /// 「过滤条件」头带：左栏宽的蓝底 + 居中青字 + 底下 1 设备亮蓝线。
+    Panel MarketBand(string title) {
+        Panel wrap = Panel.Column(); wrap.Pad(0); wrap.Gap(0);
+        wrap.Prefer(0, Spec.MkBand2H() + Spec.MkBandLine());
+        Panel band = Panel.Row(); band.Class = "mk-band";
+        band.Pad(0); band.Prefer(0, Spec.MkBand2H());
+        Panel c = Panel.Row(); c.Class = "mk-cell mk-fill"; c.Pad(0);
+        c.Prefer(0, Spec.MkBand2H());
+        c.With(Text(title, "mk-band-t", 0));
+        band.With(c); wrap.With(band);
+        Panel line = Panel.Row(); line.Class = "mk-band-line";
+        line.Pad(0); line.Prefer(0, Spec.MkBandLine()); wrap.With(line);
+        return wrap;
+    }
+
+    Panel MarketLabel(string s) {
+        Panel r = Panel.Row(); r.Class = "mk-label-row";
+        r.Pad(0); r.Prefer(0, Spec.MkLabelH());
+        r.Padding(0, 0, 0, Spec.MkLabelPadL());
+        Label t = Text(s, "mk-label", 0); t.Prefer(0, Spec.MkLabelH());
+        r.With(t);
+        return r;
+    }
+
+    // ------------------------------------------------------------------
+    //  右：表格盒（表头在顶带，盒里只有行）+ 页脚
+    // ------------------------------------------------------------------
+    Panel MarketTable() {
+        Panel box = Panel.Column(); box.Class = "mk-box mk-fill";
+        box.Pad(0); box.Gap(0); box.Prefer(0, 0);
+        box.Padding(0, Spec.MkRowPadX(), Spec.MkBoxPadB(), Spec.MkRowPadX());
+
+        List<int> ws = Spec.MkCols();
+        box.With(TblPad(Spec.MkHeadToRow()));
+
+        List<MarketRow> rows = MarketData();
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            box.With(MarketRowBox(rows[r], ws));
+            if (r + 1 < rows.Count) { box.With(TblPad(Spec.MkRowGap())); }
+        }
+        return box;
+    }
+
+    /// 一行：黑底上的盒子，六个格子横排（格子无底色，只有行有）。
+    Panel MarketRowBox(MarketRow it, List<int> ws) {
+        Panel row = Panel.Row(); row.Class = "mk-row";
+        row.Pad(0); row.Gap(0); row.Prefer(0, Spec.MkRowH());
+
+        // 名称：格框精灵 + 两行字
+        Panel c0 = Panel.Row(); c0.Class = "mk-cell-l"; c0.Pad(0);
+        c0.Prefer(ws[0], Spec.MkRowH()); c0.Gap(Spec.MkIconGap());
+        c0.Padding(Spec.MkIconPadT(), 0, 0, Spec.MkIconPadL());
+        c0.With(SpriteCellAt("", Spec.MkIconW(), Spec.MkIconH(), ItemArtPath(it.picture),
+                             it.BadgeText(), "slot-badge mk-badge",
+                             Spec.MkBadgeX(), Spec.MkBadgeY()));
+        Panel txt = Panel.Column(); txt.Pad(0); txt.Gap(0);
+        txt.Padding(Spec.MkNamePadT(), 0, 0, 0);
+        Label nm = Text(it.name, "mk-name", 0); nm.Prefer(0, Spec.MkNameH()); txt.With(nm);
+        Label sub = Text(it.SubText(), "mk-sub", 0); sub.Prefer(0, Spec.MkSubH()); txt.With(sub);
+        c0.With(txt);
+        row.With(c0);
+
+        // 价格：金币图左锚 798、数字左锚 849
+        Panel c1 = Panel.Row(); c1.Class = "mk-cell-l"; c1.Pad(0);
+        c1.Prefer(ws[1], Spec.MkRowH());
+        c1.Padding(0, 0, 0, Spec.MkCoinPadL()); c1.Gap(Spec.MkCoinGap());
+        Panel coin = Panel.Row(); coin.Pad(0); coin.Prefer(Spec.MkCoinW(), Spec.MkCoinH());
+        Image ci = new Image(ShopCoinPath(false), "金币", "contain"); ci.DockFill(); coin.Add(ci);
+        c1.With(coin);
+        c1.With(Text(it.PriceText(), "mk-price", 0));
+        row.With(c1);
+
+        // 寄售人：居中
+        Panel c2 = Panel.Row(); c2.Class = "mk-cell"; c2.Pad(0);
+        c2.Prefer(ws[2], Spec.MkRowH());
+        c2.With(Text(it.seller, "mk-seller", 0));
+        row.With(c2);
+
+        // 加密：标签框左锚 1133 + 锁标 1167
+        Panel c3 = Panel.Row(); c3.Class = "mk-cell-l"; c3.Pad(0);
+        c3.Prefer(ws[3], Spec.MkRowH()); c3.Gap(Spec.MkLockGap());
+        c3.Padding(0, 0, 0, Spec.MkTagPadL());
+        Panel tbox = Panel.Row(); tbox.Class = "mk-cell"; tbox.Pad(0);
+        tbox.Prefer(Spec.MkTagW(), Spec.MkRowH());
+        if (it.tag.Length > 0) { tbox.With(Text(it.tag, "mk-tag", 0)); }
+        c3.With(tbox);
+        if (it.locked) {
+            Panel lk = Panel.Row(); lk.Pad(0); lk.Prefer(Spec.MkLockW(), Spec.MkLockH());
+            Image li = new Image(LockPath(), "锁", "contain"); li.DockFill(); lk.Add(li);
+            c3.With(lk);
+        }
+        row.With(c3);
+
+        // 时长：居中橙字
+        Panel c4 = Panel.Row(); c4.Class = "mk-cell"; c4.Pad(0);
+        c4.Prefer(ws[4], Spec.MkRowH());
+        c4.With(Text(it.TimeText(), "mk-time", 0));
+        row.With(c4);
+
+        // 操作：购买钮居中
+        Panel c5 = Panel.Row(); c5.Class = "mk-cell mk-fill"; c5.Pad(0);
+        c5.Prefer(0, Spec.MkRowH());
+        MarketRow pick = it;
+        c5.With(BtnDev("购 买", "tbl-btn mk-buy", Spec.MkBuyW(), Spec.MkBuyH(),
+                       () => { MarketBuy(pick); }));
+        row.With(c5);
+        return row;
+    }
+
+    /// 页脚带：无自底色，左三钮 + 右分页（标准库 Pagination simple 档 + 跳转输入）。
+    Panel MarketFoot() {
+        Panel f = Panel.Row(); f.Class = "mk-foot mk-fixed";
+        f.Pad(0); f.Gap(Spec.MkFootGap());
+        f.Prefer(0, Spec.MkFootH());
+        f.Padding(Spec.MkFootPadT(), Spec.MkFootPadR(), 0, Spec.MkFootPadL());
+        f.With(BtnDev("我的寄售", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
+                      () => { MarketFootAct("我的寄售"); }));
+        f.With(BtnDev("一键领取", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
+                      () => { MarketFootAct("一键领取"); }));
+        f.With(BtnDev("重新上架", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
+                      () => { MarketFootAct("重新上架"); }));
+        Panel sp = Panel.Row(); sp.Class = "mk-fill"; sp.Pad(0); f.With(sp);
+        SignalInt pgSig = new SignalInt(1);
+        Pagination pg = new Pagination(Spec.MkPages(), pgSig);
+        pg.Class = "simple";
+        pg.PrevText("上一页"); pg.NextText("下一页");
+        pg.Jumper(true); pg.JumperLabel("跳转到");
+        pg.Named("market-pager");
+        f.With(pg);
+        return f;
+    }
+
+    // ------------------------------------------------------------------
+    //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
+    // ------------------------------------------------------------------
+    void MarketPickCat(int i) {
+        string msg = "交易市场：" + MarketCats()[i] + "（数据未接）";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+    void MarketSearch() {
+        string msg = "交易市场：搜索（数据未接）";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+    void MarketBuy(MarketRow it) {
+        string msg = "购买「" + it.name + "」需要 " + it.PriceText() + " 金币（交易未接）";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+    void MarketFootAct(string what) {
+        string msg = "交易市场：" + what + "（未接）";
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}

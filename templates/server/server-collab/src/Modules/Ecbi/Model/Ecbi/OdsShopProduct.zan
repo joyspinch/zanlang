@@ -1,0 +1,27 @@
+using System.Data.Orm;
+
+namespace ZanWeb.Model.Ecbi;
+
+/* 商品-店铺链接映射：同一内部商品在各平台/店铺的不同链接。productId + shopId 组合；outerCode 存平台侧商品编码。 */
+[Table(Name = "ods_shop_product")]
+class OdsShopProduct {
+    [Column(IsIdentity = true)]
+    int id;
+
+    /* 归属租户（软隔离基列，#34）。ORM DDL 不生成 DEFAULT 子句（见 OrmDialect.Ty），
+       列默认由字段初始化器保证：所有 new OdsShopProduct() 插入路径写 1。 */
+    [Column(IsNullable = false)]
+    int tenantId = 1;
+
+    int productId;
+
+    int shopId;
+
+    [Column(StringLength = 128)]
+    string outerCode;
+
+    [Column(StringLength = 256)]
+    string url;
+
+    long createdAt;
+}

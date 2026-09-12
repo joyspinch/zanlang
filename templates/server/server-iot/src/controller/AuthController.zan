@@ -1,0 +1,44 @@
+using System;
+using System.Json;
+
+namespace ZanWeb;
+
+/* 管理控制台会话认证。演示凭证 admin/admin 映射 uid "1"（rank 9 via DefaultAuth），替换为自有用户存储。令牌通过 Authorization: Bearer <token> 或 zsession cookie 传递。 */
+class AuthController {
+    [Post]
+    [Title("登录")]
+    static async void Login(HttpContext ctx) {
+        string user = ctx.In("user");
+        string pass = ctx.In("pass");
+        Validator v = new Validator();
+        v.Require(user, "user");
+        v.MaxLen(user, 32, "user");
+        v.Require(pass, "pass");
+        v.MaxLen(pass, 64, "pass");
+        if (!v.Ok()) {
+            ctx.Status(422, "Unprocessable Entity");
+            ctx.Api("1003", "validation failed", v.ErrorsJson());
+            return;
+        }
+        if (user == "admin" && pass == "admin") {
+            string token = WebHost.Current().sessions.Issue("1", WebApp.NowSeconds());
+            ctx.SetCookie("zsession", token, 86400);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("token", JsonValue.NewStr(token));
+            Reply.Ok(ctx, o.ToJson());
+        } else {
+            Reply.Fail(ctx, 401, "1001", "bad credentials");
+        }
+    }
+
+    [Get]
+    [Title("当前用户")]
+    [Login]
+    static async void Me(HttpContext ctx) {
+        // 框架把解析出的身份放在 HttpContext.uid（typed 字段，0c5c6164 起
+        // 取代旧 state 草稿表）；rank 随登录用户的存储而异，这里只回显 uid。
+        JsonValue o = JsonValue.NewObject();
+        o.Put("uid", JsonValue.NewStr(ctx.uid));
+        Reply.Ok(ctx, o.ToJson());
+    }
+}

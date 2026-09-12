@@ -1,0 +1,259 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Crm;
+
+namespace ZanWeb.Admin.Crm;
+
+/* /admin/crm/opportunities 商机管理：列表、建、编、删、阶段推进。阶段推进只改 stage 字段，不删记录。 */
+[Route("admin/crm/opportunities/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("商机管理")]
+class Opportunities : AdminController {
+    [HttpGet]
+    [Route("/admin/crm/opportunities")]
+    [Custom(IsMenu = true, Icon = "mdi:target", Perm = PermBit.View)]
+    [Description("商机管理")]
+    async void Index() {
+        ViewData d = await this.Layout("商机管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        /* 租户硬边（#34）：列表只出本租户行，外键解析的客户选项同链。 */
+        List<CrmOpportunity> rows = await this.CrmOpportunity
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.CrmOpportunity
+            .Where(a => a.tenantId == this.TenantId()).CountAsync();
+        List<CrmCustomer> custs = await this.CrmCustomer
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity o = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(o.id));
+            row.Set("title", o.title);
+            row.Set("customer", Opportunities.CustName(custs, o.customerId));
+            row.Set("amount", Convert.ToString(o.amount));
+            row.Set("stageText", Opportunities.StageText(o.stage));
+            row.Set("stageClass", Opportunities.StageClass(o.stage));
+            row.Set("nextStage", Convert.ToString(Opportunities.NextStage(o.stage)));
+            row.Set("advanceText", Opportunities.AdvanceText(o.stage));
+            row.Set("canAdvance", (o.stage >= 1 && o.stage < 5) ? "1" : "");
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("商机表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        CrmOpportunity o = null;
+        if (id > 0) {
+            o = await this.CrmOpportunity
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (o == null) { this.Fail(404, "0404", "商机不存在"); }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑商机" : "新增商机");
+        if (id <= 0) { d.Set("new", "1"); d.Set("stage1", "selected"); }
+        else { d.Set("edit", "1"); }
+
+        List<CrmCustomer> custs = await this.CrmCustomer
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> copts = d.AddList("customers");
+        for (int i = 0; i < custs.Count; i = i + 1) {
+            StrMap opt = new StrMap();
+            opt.Set("id", Convert.ToString(custs[i].id));
+            opt.Set("name", custs[i].name);
+            if (o != null && custs[i].id == o.customerId) { opt.Set("selected", "selected"); }
+            copts.Add(opt);
+        }
+        if (o != null) {
+            d.Set("title", o.title);
+            d.Set("amount", Convert.ToString(o.amount));
+            d.Set("stage1", ""); d.Set("stage2", ""); d.Set("stage3", "");
+            d.Set("stage4", ""); d.Set("stage5", "");
+            if (o.stage == 1) { d.Set("stage1", "selected"); }
+            else if (o.stage == 2) { d.Set("stage2", "selected"); }
+            else if (o.stage == 3) { d.Set("stage3", "selected"); }
+            else if (o.stage == 4) { d.Set("stage4", "selected"); }
+            else if (o.stage == 5) { d.Set("stage5", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存商机")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        int customerId = this.InInt("customerId", 0);
+        string title = this.Need("title", "商机名称");
+        long amount = (long)this.InInt("amount", 0);
+        int stage = this.InInt("stage", 1);
+        if (customerId <= 0) { this.Fail(400, "0004", "请选择客户"); }
+
+        if (id > 0) {
+            int n = await this.CrmOpportunity.Update()
+                .Set(a => a.customerId, customerId)
+                .Set(a => a.title, title)
+                .Set(a => a.amount, amount)
+                .Set(a => a.stage, stage)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑商机", "#" + Convert.ToString(id) + " " + title, n > 0, "");
+            this.Saved("商机已保存");
+            return;
+        }
+        CrmOpportunity o = new CrmOpportunity();
+        o.tenantId = this.TenantId();
+        o.customerId = customerId;
+        o.title = title;
+        o.amount = amount;
+        o.stage = stage;
+        o.createdAt = WebApp.NowSeconds();
+        o.updatedAt = o.createdAt;
+        int newId = await this.CrmOpportunity.Insert(o).ExecuteIdentityAsync();
+        await this.Note("新增商机", "#" + Convert.ToString(newId) + " " + title, newId > 0, "");
+        this.Saved("商机已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("推进商机阶段")]
+    async void Stage() {
+        int id = this.InInt("id", 0);
+        int stage = this.InInt("stage", 1);
+        CrmOpportunity o = await this.CrmOpportunity
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (o == null) { this.Fail(404, "0404", "商机不存在"); }
+        int n = await this.CrmOpportunity.Update()
+            .Set(a => a.stage, stage)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        await this.Note("推进商机", "#" + Convert.ToString(id) + " → " + Opportunities.StageText(stage), n > 0, "");
+        this.Saved("已更新阶段：" + Opportunities.StageText(stage));
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除商机")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        CrmOpportunity o = await this.CrmOpportunity
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (o == null) { this.Fail(404, "0404", "商机不存在"); }
+        int n = await this.CrmOpportunity.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        await this.Note("删除商机", "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("商机已删除");
+    }
+
+    static string CustName(List<CrmCustomer> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == id) { return list[i].name; }
+        }
+        return "—";
+    }
+
+    static string StageText(int stage) {
+        if (stage == 1) { return "初步接触"; }
+        if (stage == 2) { return "需求确认"; }
+        if (stage == 3) { return "方案报价"; }
+        if (stage == 4) { return "谈判"; }
+        if (stage == 5) { return "赢单"; }
+        return "输单";
+    }
+
+    static string StageClass(int stage) {
+        if (stage == 5) { return "ok"; }
+        if (stage == 0) { return "off"; }
+        return "warn";
+    }
+
+    static int NextStage(int stage) {
+        if (stage >= 1 && stage < 5) { return stage + 1; }
+        return stage;
+    }
+
+    static string AdvanceText(int stage) {
+        if (stage >= 1 && stage < 5) { return "推进"; }
+        return "已结束";
+    }
+
+    /* ---- T7 商机报表发邮箱（验收场景）----------------------------------
+       xlsx 报表先落盘 data/exports/，SMTP 已配置且给了收件人则发通知邮件；
+       未配置走离线闭环（文件生成即证据）。偏差记录 ⑥：Mailer 为纯文本
+       SMTP 客户端，无 MIME 附件能力——邮件只告知报表位置，附件直发
+       留待引入 multipart 邮件后。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Export)]
+    [Description("商机报表发邮箱")]
+    async void MailExport() {
+        string to = Fmt.Text(this.In("to"), "");
+        List<CrmOpportunity> rows = await this.CrmOpportunity
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<CrmCustomer> custs = await this.CrmCustomer
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+
+        List<string> headers = new List<string>();
+        headers.Add("商机"); headers.Add("客户"); headers.Add("金额(分)");
+        headers.Add("阶段");
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity o = rows[i];
+            List<string> r = new List<string>();
+            r.Add(o.title);
+            r.Add(Opportunities.CustName(custs, o.customerId));
+            r.Add(Convert.ToString(o.amount));
+            r.Add(Opportunities.StageText(o.stage));
+            data.Add(r);
+        }
+        List<List<string>> all = new List<List<string>>();
+        all.Add(headers);
+        for (int i = 0; i < data.Count; i = i + 1) { all.Add(data[i]); }
+
+        string rel = "data/exports/商机-" + Convert.ToString(WebApp.NowSeconds())
+            + ".xlsx";
+        if (!Directory.Exists("data/exports")) {
+            Directory.CreateDirectoryRecursive("data/exports");
+        }
+        File.WriteAllBytes(rel, XlsxBook.FromText(all, true).SaveToBytes());
+
+        string mail = "离线闭环：报表已生成 " + rel;
+        if (to.Length > 0) {
+            if (!await Mailer.Ready()) {
+                mail = "邮件服务未配置（离线闭环：报表已生成 " + rel + "）";
+            } else {
+                MailResult mr = await Mailer.Send(to, "商机报表",
+                    "商机报表已生成：" + rel);
+                mail = mr.Ok() ? "已发送至 " + to + "（报表：" + rel + "）"
+                    : mr.Message();
+            }
+        }
+        await this.Note("商机报表", mail, true, "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("file", JsonValue.NewStr(rel));
+        o.Put("mail", JsonValue.NewStr(mail));
+        this.Ok(o.ToJson());
+    }
+}

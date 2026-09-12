@@ -1,0 +1,118 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Lic;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Lic;
+
+/* /admin/lic/devices 设备与会话：lic_device 绑定表（解绑按钮调
+ * LicenseFlow.UnbindDevice）+ lic_session 在线座位一览（只读，随心跳自清）。*/
+[Route("admin/lic/devices/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("设备与会话")]
+class Devices : AdminController {
+    [HttpGet]
+    [Route("/admin/lic/devices")]
+    [Custom(IsMenu = true, Icon = "mdi:laptop", Perm = PermBit.View)]
+    [Description("设备与会话")]
+    async void Index() {
+        ViewData d = await this.Layout("设备与会话");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int productId = this.InInt("product", 0);
+        List<ZanWeb.Model.Lic.Product> products = await this.Product
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> popts = d.AddList("products");
+        for (int i = 0; i < products.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(products[i].id));
+            o.Set("name", products[i].name);
+            if (products[i].id == productId) { o.Set("selected", "selected"); }
+            popts.Add(o);
+        }
+        d.Set("product", Convert.ToString(productId));
+
+        long now = WebApp.NowSeconds();
+        int total = await this.LicenseDevice
+            .WhereIf(kw.Length > 0, a => a.deviceFp.Contains(kw))
+            .WhereIf(kw.Length > 0, a => a.subject.Contains(kw))
+            .WhereIf(productId > 0, a => a.productId == productId)
+            .CountAsync();
+        List<ZanWeb.Model.Lic.LicenseDevice> rows = await this.LicenseDevice
+            .WhereIf(kw.Length > 0, a => a.deviceFp.Contains(kw))
+            .WhereIf(kw.Length > 0, a => a.subject.Contains(kw))
+            .WhereIf(productId > 0, a => a.productId == productId)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+
+        List<LicenseSession> live = await this.LicenseSession
+            .Where(a => a.lastSeen > now - 300)
+            .OrderByDescending(a => a.lastSeen).ToListAsync();
+        List<StrMap> seats = d.AddList("seats");
+        for (int i = 0; i < live.Count; i = i + 1) {
+            LicenseSession s = live[i];
+            StrMap row = new StrMap();
+            row.Set("subject", Fmt.Dash(s.subject));
+            row.Set("deviceFp", s.deviceFp);
+            row.Set("lastSeen", Fmt.Stamp(s.lastSeen));
+            row.Set("ago", Devices.Ago(now - s.lastSeen));
+            seats.Add(row);
+        }
+        if (live.Count == 0) { d.Set("noSeats", "1"); }
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            ZanWeb.Model.Lic.LicenseDevice dev = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(dev.id));
+            row.Set("productName", Devices.ProductName(products, dev.productId));
+            row.Set("subject", Fmt.Dash(dev.subject));
+            row.Set("deviceFp", dev.deviceFp);
+            row.Set("modeText", Devices.ModeText(dev.mode));
+            row.Set("createdAt", Fmt.Stamp(dev.createdAt));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("解绑设备")]
+    async void Unbind() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        int id = this.InInt("id", 0);
+        bool ok = await LicenseFlow.UnbindDevice(this.Held(), id);
+        await this.Note("解绑设备", "#" + Convert.ToString(id), ok, "");
+        if (!ok) { this.Fail(404, "0404", "设备不存在"); }
+        this.Saved("设备已解绑，用户可在新机器上重新激活");
+    }
+
+    static string ProductName(List<ZanWeb.Model.Lic.Product> products,
+                              int productId) {
+        for (int i = 0; i < products.Count; i = i + 1) {
+            if (products[i].id == productId) { return products[i].name; }
+        }
+        return "#" + Convert.ToString(productId);
+    }
+
+    static string ModeText(string mode) {
+        if (mode == "account") { return "账号"; }
+        if (mode == "signed") { return "离线证书"; }
+        if (mode == "online") { return "在线"; }
+        return "激活码";
+    }
+
+    static string Ago(long seconds) {
+        if (seconds < 60) { return Convert.ToString(seconds) + " 秒前"; }
+        if (seconds < 3600) {
+            return Convert.ToString(seconds / 60) + " 分钟前";
+        }
+        return Convert.ToString(seconds / 3600) + " 小时前";
+    }
+}
